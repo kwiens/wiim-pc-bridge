@@ -4,6 +4,8 @@
 
 - Preserve the active Spotify volume when playback moves to the PC + WiiM
   Connect target and retain the last stable level across bridge restarts.
+- License the project under MIT and broaden the architecture and use-case
+  documentation beyond the reference PC + WiiM deployment.
 
 ## v1.0.1 - 2026-09-13
 

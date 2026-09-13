@@ -1,27 +1,61 @@
-# PC + WiiM Spotify bridge
+# Spotify Connect bridge for Linux and AirPlay audio
 
-This project creates one Spotify Connect target that plays in sync through a
-Linux PC and an existing native WiiM multi-room group.
+Turn a Linux machine into one Spotify Connect target that plays through local
+audio hardware and networked AirPlay speakers at the same time. The reference
+deployment synchronizes a PC's DisplayPort audio with an existing WiiM
+multi-room group, but the underlying pipeline is useful anywhere local and
+network audio outputs need to share one Spotify source and one timeline.
 
-```text
-Spotify -> Soloist -> private PipeWire sink -> PCM FIFO -> OwnTone
-                                                       |       |
-                                                       |       +-> WiiM leader
-                                                       |                |
-                                                       |                +-> native WiiM followers
-                                                       +-> Shairport -> PC audio sink
+The bridge keeps Spotify isolated from the desktop's default audio route,
+offers independent output levels and timing offsets, preserves volume during
+Connect handoffs, and restores the working topology after a reboot.
+
+## How it works
+
+```mermaid
+flowchart TB
+    spotify(["Spotify apps<br/>phone · desktop · web"])
+    pipeline["Linux bridge host<br/><br/>Soloist receiver → private PipeWire sink → PCM FIFO → OwnTone<br/>volume-preserving handoff · buffered, clocked fan-out"]
+    local(["Local path · AirPlay 1<br/>Shairport Sync → PipeWire<br/>HDMI · USB DAC · analog"])
+    leader(["Network path · AirPlay 2<br/>compatible speaker or native group leader"])
+    followers(["Optional native follower speakers"])
+
+    spotify -->|"Spotify Connect"| pipeline
+    pipeline -->|"timestamped stream"| local
+    pipeline -->|"timestamped stream"| leader
+    leader -->|"native multi-room transport"| followers
 ```
 
-OwnTone sends exactly one AirPlay 2 stream to the configured WiiM leader. The
-leader distributes that stream to its existing followers using WiiM MRM. The PC
-receives a separately timestamped classic AirPlay stream through Shairport Sync.
-The bridge never makes the PC a native WiiM follower and never selects a WiiM
-follower independently.
+OwnTone timestamps both output paths. The local path loops back through
+Shairport Sync to any PipeWire-supported audio device. The network path sends
+one AirPlay 2 stream to a compatible speaker or group leader; in the reference
+WiiM setup, that leader distributes the stream to its native followers. The
+bridge never selects a WiiM follower independently or changes native group
+membership.
 
-All paths are buffered for synchronized music. This is not intended for games
-or lip-synced video.
+All paths are buffered for synchronized music. This is designed for music, not
+games or lip-synced video.
 
-## Requirements
+## Where this can be useful
+
+- Add speakers connected to a Linux PC, mini PC, or home server to an existing
+  AirPlay listening zone.
+- Play Spotify through a legacy amplifier or powered monitors via a USB DAC
+  while keeping network speakers synchronized.
+- Feed a native multi-room group through its leader without dismantling or
+  duplicating the vendor-managed group.
+- Build a headless, auto-recovering Spotify-to-AirPlay gateway for a media rack,
+  workshop, office, or whole-home audio system.
+- Use the PipeWire-to-PCM-to-OwnTone pipeline as a starting point for other
+  mixed local/network audio experiments.
+
+Today, the supplied reconciliation and health-check tooling intentionally
+targets one local AirPlay 1 receiver plus one AirPlay 2 WiiM leader with a
+native follower. The media pipeline is more general; supporting standalone
+AirPlay speakers, another multi-room vendor, or more output branches mainly
+requires adapting the topology guard and output-selection policy.
+
+## Reference deployment requirements
 
 - Linux with PipeWire's PulseAudio compatibility service
 - Docker Engine with Docker Compose v2
@@ -76,7 +110,9 @@ Select the configured bridge name (default: **PC + WiiM**) in Spotify and play
 normally. The user service remembers the stable volume of the active Spotify
 device while the bridge is inactive and reapplies it when playback moves to the
 bridge. This keeps Spotify's volume slider from jumping when **PC + WiiM** is
-selected. Useful controls are:
+selected. It reads the live level from Spotify's Linux desktop MPRIS interface;
+if that client is unavailable, it reuses the last saved level (40% on a fresh
+installation). Useful controls are:
 
 ```bash
 ./bridge.py status
@@ -191,5 +227,8 @@ docker compose --env-file .env.example config --quiet
 
 OwnTone's local web interface is available at <http://127.0.0.1:3689>.
 
-See [SECURITY.md](SECURITY.md) before making a fork public. No license has been
-selected yet; choose one deliberately before publishing this as open source.
+See [SECURITY.md](SECURITY.md) before making a fork public.
+
+## License
+
+Released under the [MIT License](LICENSE).

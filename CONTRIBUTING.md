@@ -10,7 +10,8 @@ python3 -m pip install --requirement requirements-dev.txt
 python3 -m unittest discover -s tests -v
 ruff check .
 ruff format --check .
-bandit -q -r bridge.py bridge_config.py doctor.py render-config.py scripts/check-secrets.py
+bandit -q -r bridge.py bridge_config.py doctor.py render-config.py \
+  volume_handoff.py scripts/check-secrets.py
 yamllint .github compose.yaml
 docker compose --env-file .env.example config --quiet
 docker run --rm -v "$PWD:/mnt:ro" koalaman/shellcheck:v0.11.0 \
