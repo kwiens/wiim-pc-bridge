@@ -7,6 +7,8 @@ api_key_file=/run/secrets/soloist_api_key
 audio_fifo=/srv/media/spotify.pcm
 sink_name=${BRIDGE_SINK:-wiim_bridge}
 device_name=${SOLOIST_DEVICE_NAME:-PC + WiiM}
+volume_file=/var/lib/soloist/handoff-volume
+initial_volume=40
 module_id=""
 capture_pid=""
 soloist_pid=""
@@ -49,6 +51,25 @@ if [ -z "$api_key" ]; then
   exit 1
 fi
 
+# Start at the last stable Spotify source volume. The host monitor refreshes
+# this private state file while Soloist is inactive and corrects the live level
+# as soon as a handoff occurs.
+if [ -r "$volume_file" ]; then
+  saved_volume=$(tr -d '[:space:]' < "$volume_file")
+  case "$saved_volume" in
+    '' | *[!0-9]*)
+      echo "Ignoring invalid saved Spotify volume" >&2
+      ;;
+    *)
+      if [ "${#saved_volume}" -le 3 ] && [ "$saved_volume" -le 100 ]; then
+        initial_volume=$saved_volume
+      else
+        echo "Ignoring invalid saved Spotify volume" >&2
+      fi
+      ;;
+  esac
+fi
+
 # A user service can start while PipeWire is still settling after boot. Wait
 # for the Pulse compatibility server instead of entering a restart storm.
 attempt=0
@@ -88,7 +109,7 @@ echo "$capture_pid" > /tmp/parec.pid
   --device-name "$device_name" \
   --api-key "$api_key" \
   --pipewire-device "$sink_name" \
-  --initial-volume 100 \
+  --initial-volume "$initial_volume" \
   --data-dir /var/lib/soloist \
   --cache-dir /var/cache/soloist \
   --cache-size 1024 \

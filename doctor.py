@@ -153,12 +153,32 @@ def check_startup() -> None:
         )
         enabled = run("systemctl", "--user", "is-enabled", "wiim-pc-bridge.service")
         active = run("systemctl", "--user", "is-active", "wiim-pc-bridge.service")
-        if linger == "yes" and enabled == "enabled" and active == "active":
-            report("PASS", "boot service is active with user lingering enabled")
+        main_pid = run(
+            "systemctl",
+            "--user",
+            "show",
+            "wiim-pc-bridge.service",
+            "--property=MainPID",
+            "--value",
+        )
+        monitor_running = main_pid.isdigit() and int(main_pid) > 0
+        if (
+            linger == "yes"
+            and enabled == "enabled"
+            and active == "active"
+            and monitor_running
+        ):
+            report(
+                "PASS",
+                "boot service and volume handoff monitor are active with user "
+                "lingering enabled",
+            )
         else:
             report(
                 "FAIL",
-                f"boot service state is linger={linger}, enabled={enabled}, active={active}",
+                "boot service state is "
+                f"linger={linger}, enabled={enabled}, active={active}, "
+                f"monitor_pid={main_pid or 'none'}",
             )
         for container in CONTAINERS:
             policy = run(

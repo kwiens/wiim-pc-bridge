@@ -6,12 +6,12 @@ StartLimitIntervalSec=300
 StartLimitBurst=5
 
 [Service]
-Type=oneshot
-RemainAfterExit=yes
+Type=exec
 WorkingDirectory=@PROJECT_DIRECTORY@
 ExecStartPre=@PROJECT_DIRECTORY@/ensure-runtime.sh
-ExecStart=/usr/bin/docker compose --env-file @PROJECT_DIRECTORY@/.env up -d --wait --wait-timeout 180 --remove-orphans
-ExecStartPost=@PROJECT_DIRECTORY@/bridge.py reconcile --wait-seconds 180
+ExecStartPre=/usr/bin/docker compose --env-file @PROJECT_DIRECTORY@/.env up -d --wait --wait-timeout 180 --remove-orphans
+ExecStartPre=@PROJECT_DIRECTORY@/bridge.py reconcile --wait-seconds 180
+ExecStart=/usr/bin/python3 @PROJECT_DIRECTORY@/volume_handoff.py
 ExecStop=-/usr/bin/docker compose --env-file @PROJECT_DIRECTORY@/.env stop
 Restart=on-failure
 RestartSec=10s

@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Preserve the active Spotify volume when playback moves to the PC + WiiM
+  Connect target and retain the last stable level across bridge restarts.
+
 ## v1.0.1 - 2026-09-13
 
 - Validate configuration structure, paths, volumes, offsets, buffer bounds, and

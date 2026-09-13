@@ -73,7 +73,10 @@ later requires running the installer again.
 ## Normal use
 
 Select the configured bridge name (default: **PC + WiiM**) in Spotify and play
-normally. Useful controls are:
+normally. The user service remembers the stable volume of the active Spotify
+device while the bridge is inactive and reapplies it when playback moves to the
+bridge. This keeps Spotify's volume slider from jumping when **PC + WiiM** is
+selected. Useful controls are:
 
 ```bash
 ./bridge.py status
@@ -133,6 +136,8 @@ context.
 - All containers use `unless-stopped`; systemd waits for PipeWire and Docker.
 - Startup reconciliation restores output selection, volume and offsets rather
   than relying only on OwnTone's cache database.
+- The host-side handoff monitor preserves Spotify's source volume when Soloist
+  becomes active and stores only the numeric level for the next restart.
 - `doctor.py` audits secrets, containers, startup, audio routing, output state,
   WiiM topology, and Soloist expiry without changing the system.
 

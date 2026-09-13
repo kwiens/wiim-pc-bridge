@@ -24,7 +24,9 @@ jobs:
       - name: Python tests
         run: python -m unittest discover -s tests -v
       - name: Python syntax
-        run: python -m compileall -q bridge.py bridge_config.py doctor.py render-config.py tests
+        run: >-
+          python -m compileall -q bridge.py bridge_config.py doctor.py
+          render-config.py volume_handoff.py tests
       - name: Python lint and formatting
         run: |
           ruff check .
@@ -32,7 +34,7 @@ jobs:
       - name: Python security scan
         run: >-
           bandit -q -r bridge.py bridge_config.py doctor.py render-config.py
-          scripts/check-secrets.py
+          volume_handoff.py scripts/check-secrets.py
       - name: YAML lint
         run: yamllint .github compose.yaml
       - name: Compose validation
