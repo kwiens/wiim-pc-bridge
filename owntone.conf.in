@@ -1,0 +1,49 @@
+general {
+	uid = "owntone"
+	db_path = "/var/cache/owntone/database.db"
+	db_backup_path = "/var/cache/owntone/database.bak"
+	logfile = "/dev/stderr"
+	loglevel = info
+	trusted_networks = { "127.0.0.1", "@TRUSTED_NETWORK@" }
+	ipv6 = no
+	start_buffer_ms = @START_BUFFER_MS@
+}
+
+library {
+	name = "@BRIDGE_FRIENDLY_NAME@ Bridge"
+	port = 3689
+	directories = { "/srv/media" }
+	pipe_autostart = true
+	filescan_disable = false
+}
+
+# Local playback goes through Shairport Sync. OwnTone's direct ALSA backend
+# requires a mixer that many DisplayPort codecs do not provide.
+audio {
+	type = "disabled"
+}
+
+# Send one stream to the current WiiM MRM leader. It forwards the stream to
+# its native followers using WiiM's MRM transport.
+airplay "@KITCHEN_DEVICE_NAME@" {
+	permanent = true
+	airplay2_disable = false
+	nickname = "@WIIM_OUTPUT_NAME@"
+}
+
+# Shairport Sync renders this NTP-timed classic AirPlay stream on the PC.
+airplay "@LOCAL_OUTPUT_NAME@" {
+	permanent = true
+	airplay2_disable = true
+	nickname = "@LOCAL_OUTPUT_NAME@"
+}
+
+mpd {
+	port = 6600
+	http_port = 0
+}
+
+streaming {
+	sample_rate = 44100
+	bit_rate = 320
+}

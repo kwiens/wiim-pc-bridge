@@ -1,0 +1,8 @@
+.git
+.secrets
+.env
+cache
+runtime
+media
+__pycache__
+*.pyc

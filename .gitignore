@@ -1,0 +1,7 @@
+cache/
+runtime/
+media/spotify.pcm
+.secrets/
+.env
+__pycache__/
+*.pyc

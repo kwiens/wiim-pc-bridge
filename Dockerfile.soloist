@@ -1,0 +1,22 @@
+FROM docker.io/library/ubuntu@sha256:513c074113a871b51a8d16ab445c88779d6452d937a164fb5cc479f32668a41d
+
+ARG SOLOIST_ARCHIVE_SHA256=33266e7d9ed899b380b7491ea9a833b095dd8704fe9a7abd79f1a51a4983669a
+
+RUN DEBIAN_FRONTEND=noninteractive apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        ca-certificates \
+        curl \
+        libatomic1 \
+        pulseaudio-utils \
+    && curl --fail --silent --show-error --location \
+        https://soloist-builds.spotifycdn.com/soloist_release_x86_64.tar.gz \
+        --output /tmp/soloist.tar.gz \
+    && echo "${SOLOIST_ARCHIVE_SHA256}  /tmp/soloist.tar.gz" | sha256sum --check --strict \
+    && tar --extract --gzip --file /tmp/soloist.tar.gz --directory /usr/local/bin soloist \
+    && chmod 0755 /usr/local/bin/soloist \
+    && rm /tmp/soloist.tar.gz \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY soloist-entrypoint.sh /usr/local/bin/soloist-entrypoint
+
+ENTRYPOINT ["/usr/local/bin/soloist-entrypoint"]

@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Prepare example configuration
+        run: cp .env.example .env
+      - name: Python tests
+        run: python -m unittest discover -s tests -v
+      - name: Python syntax
+        run: python -m compileall -q bridge.py bridge_config.py doctor.py render-config.py tests
+      - name: Compose validation
+        run: docker compose --env-file .env.example config --quiet
+      - name: Shell validation
+        run: shellcheck ensure-runtime.sh install-service.sh save-soloist-key.sh soloist-entrypoint.sh update-soloist.sh
+      - name: Credential scan
+        run: python scripts/check-secrets.py

@@ -1,0 +1,22 @@
+[Unit]
+Description=PC and native WiiM group Spotify bridge
+Wants=pipewire.service pipewire-pulse.service
+After=pipewire.service pipewire-pulse.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=@PROJECT_DIRECTORY@
+ExecStartPre=@PROJECT_DIRECTORY@/ensure-runtime.sh
+ExecStart=/usr/bin/docker compose --env-file @PROJECT_DIRECTORY@/.env up -d --remove-orphans
+ExecStartPost=@PROJECT_DIRECTORY@/bridge.py reconcile --wait-seconds 180
+ExecStop=-/usr/bin/docker compose --env-file @PROJECT_DIRECTORY@/.env stop
+Restart=on-failure
+RestartSec=10s
+TimeoutStartSec=420
+TimeoutStopSec=60
+
+[Install]
+WantedBy=default.target
