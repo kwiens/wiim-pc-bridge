@@ -4,8 +4,8 @@ set -eu
 project_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 config_file=${WIIM_BRIDGE_ENV:-$project_directory/.env}
 if [ -f "$config_file" ]; then
-  # shellcheck disable=SC1090
   set -a
+  # shellcheck disable=SC1090
   . "$config_file"
   set +a
 fi

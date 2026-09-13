@@ -8,8 +8,8 @@ if [ ! -f "$config_file" ]; then
   exit 1
 fi
 # The local configuration is shell-compatible and trusted by this user.
-# shellcheck disable=SC1090
 set -a
+# shellcheck disable=SC1090
 . "$config_file"
 set +a
 
