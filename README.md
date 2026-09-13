@@ -54,7 +54,7 @@ Prepare and start the bridge:
 
 ```bash
 ./ensure-runtime.sh
-docker compose up -d --build
+docker compose up -d --build --wait --wait-timeout 180
 ./bridge.py reconcile --wait-seconds 180
 ./doctor.py
 ```
@@ -67,7 +67,8 @@ loginctl enable-linger "$USER"
 ```
 
 `install-service.sh` renders a machine-local unit containing the clone's
-absolute path. Moving the repository later requires running the installer again.
+absolute path. Keep the clone path free of whitespace; moving the repository
+later requires running the installer again.
 
 ## Normal use
 
@@ -162,7 +163,8 @@ the Python tests, syntax, Compose model, shell scripts, and credential scan.
 1. Install the prerequisites and clone the private repository.
 2. Restore `.env` from a secure backup or recreate it from `.env.example`.
 3. Generate a fresh Soloist key and run `./save-soloist-key.sh`.
-4. Run `./ensure-runtime.sh` and `docker compose up -d --build`.
+4. Run `./ensure-runtime.sh` and
+   `docker compose up -d --build --wait --wait-timeout 180`.
 5. Run `./install-service.sh`, enable user lingering, and reboot once.
 6. Select the bridge in Spotify and run `./doctor.py`.
 

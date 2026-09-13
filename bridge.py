@@ -25,7 +25,9 @@ class BridgeError(RuntimeError):
     pass
 
 
-def request(path: str, method: str = "GET", payload: object | None = None) -> object | None:
+def request(
+    path: str, method: str = "GET", payload: object | None = None
+) -> object | None:
     data = None
     headers: dict[str, str] = {}
     if payload is not None:
@@ -34,12 +36,18 @@ def request(path: str, method: str = "GET", payload: object | None = None) -> ob
 
     req = urllib.request.Request(API + path, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=5) as response:
+        # API is a fixed loopback HTTP origin; caller controls only its path.
+        with urllib.request.urlopen(req, timeout=5) as response:  # nosec B310
             body = response.read()
     except urllib.error.URLError as exc:
         raise BridgeError(f"OwnTone API request failed: {exc}") from exc
 
-    return json.loads(body) if body else None
+    if not body:
+        return None
+    try:
+        return json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise BridgeError("OwnTone returned malformed JSON") from exc
 
 
 def outputs() -> list[dict[str, object]]:
@@ -54,9 +62,13 @@ def wiim_request(ip: str, command: str) -> dict[str, object]:
     req = urllib.request.Request(
         f"https://{ip}/httpapi.asp?command={encoded}", method="GET"
     )
-    context = ssl._create_unverified_context()
+    # WiiM devices use self-signed LAN certificates. The destination is a
+    # validated, configured IPv4 address inside TRUSTED_NETWORK.
+    context = ssl._create_unverified_context()  # nosec B323
     try:
-        with urllib.request.urlopen(req, timeout=5, context=context) as response:
+        with urllib.request.urlopen(  # nosec B310
+            req, timeout=5, context=context
+        ) as response:
             payload = json.load(response)
     except (urllib.error.URLError, json.JSONDecodeError) as exc:
         raise BridgeError(f"WiiM request failed for {ip}: {exc}") from exc
@@ -103,23 +115,37 @@ def find_output(
             f"Expected exactly one {output_type} output named {name!r}; "
             f"found {len(matches)}"
         )
-    return matches[0]
+    output = matches[0]
+    output_id(output)
+    return output
+
+
+def output_id(output: dict[str, object]) -> str:
+    value = output.get("id")
+    if value is None or not str(value):
+        raise BridgeError("OwnTone output is missing its id")
+    return str(value)
+
+
+def output_integer(output: dict[str, object], field: str) -> int:
+    try:
+        return int(output[field])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise BridgeError(f"OwnTone output has an invalid {field}") from exc
 
 
 def set_outputs(selected: list[dict[str, object]]) -> None:
     request(
         "/outputs/set",
         method="PUT",
-        payload={"outputs": [str(item["id"]) for item in selected]},
+        payload={"outputs": [output_id(item) for item in selected]},
     )
 
 
 def set_output_volume(output: dict[str, object], volume: int) -> None:
     if not 0 <= volume <= 100:
         raise BridgeError("volume must be between 0 and 100")
-    query = urllib.parse.urlencode(
-        {"volume": volume, "output_id": str(output["id"])}
-    )
+    query = urllib.parse.urlencode({"volume": volume, "output_id": output_id(output)})
     request(f"/player/volume?{query}", method="PUT")
 
 
@@ -127,7 +153,7 @@ def set_output_offset(output: dict[str, object], offset_ms: int) -> None:
     if not -2000 <= offset_ms <= 2000:
         raise BridgeError("offset must be between -2000 and 2000 milliseconds")
     request(
-        f"/outputs/{output['id']}",
+        f"/outputs/{output_id(output)}",
         method="PUT",
         payload={"offset_ms": offset_ms},
     )
@@ -138,10 +164,12 @@ def show_status() -> None:
     print(f"{'SEL':3}  {'VOL':>3}  {'OFFSET':>7}  {'TYPE':10}  NAME")
     for item in items:
         mark = "yes" if item.get("selected") else "no"
+        volume = output_integer(item, "volume")
+        offset_ms = output_integer(item, "offset_ms")
         print(
-            f"{mark:3}  {int(item.get('volume', 0)):>3}  "
-            f"{int(item.get('offset_ms', 0)):>6}ms  "
-            f"{str(item.get('type', '')):10}  {item.get('name', '')}"
+            f"{mark:3}  {volume:>3}  "
+            f"{offset_ms:>6}ms  "
+            f"{item.get('type', '')!s:10}  {item.get('name', '')}"
         )
 
 
@@ -196,25 +224,25 @@ def reconcile_once() -> None:
     local = find_output(items, LOCAL_NAME, "AirPlay 1")
     wiim = find_output(items, WIIM_NAME, "AirPlay 2")
 
-    set_outputs([local, wiim])
+    # Apply levels before connecting so stale cached values cannot produce an
+    # unexpectedly loud burst when the outputs become active.
     set_output_volume(local, CONFIG.local_volume)
     set_output_volume(wiim, CONFIG.wiim_volume)
     set_output_offset(local, CONFIG.local_offset_ms)
     set_output_offset(wiim, CONFIG.wiim_offset_ms)
+    set_outputs([local, wiim])
 
     refreshed = outputs()
     refreshed_local = find_output(refreshed, LOCAL_NAME, "AirPlay 1")
     refreshed_wiim = find_output(refreshed, WIIM_NAME, "AirPlay 2")
-    expected_ids = {str(local["id"]), str(wiim["id"])}
-    selected_ids = {
-        str(item["id"]) for item in refreshed if bool(item.get("selected"))
-    }
+    expected_ids = {output_id(local), output_id(wiim)}
+    selected_ids = {output_id(item) for item in refreshed if bool(item.get("selected"))}
     checks = (
         selected_ids == expected_ids,
-        int(refreshed_local.get("volume", -1)) == CONFIG.local_volume,
-        int(refreshed_wiim.get("volume", -1)) == CONFIG.wiim_volume,
-        int(refreshed_local.get("offset_ms", -9999)) == CONFIG.local_offset_ms,
-        int(refreshed_wiim.get("offset_ms", -9999)) == CONFIG.wiim_offset_ms,
+        output_integer(refreshed_local, "volume") == CONFIG.local_volume,
+        output_integer(refreshed_wiim, "volume") == CONFIG.wiim_volume,
+        output_integer(refreshed_local, "offset_ms") == CONFIG.local_offset_ms,
+        output_integer(refreshed_wiim, "offset_ms") == CONFIG.wiim_offset_ms,
     )
     if not all(checks):
         raise BridgeError("OwnTone did not retain the reconciled output state")

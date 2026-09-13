@@ -26,7 +26,10 @@ cleanup() {
   fi
 }
 
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 if [ ! -t 0 ]; then
   echo "Run this helper in an interactive terminal." >&2
@@ -55,6 +58,7 @@ esac
 
 umask 077
 mkdir -p "$key_directory"
+chmod 0700 "$key_directory"
 temporary_file=$(mktemp "$key_directory/.soloist_api_key.XXXXXX")
 printf '%s\n' "$api_key" > "$temporary_file"
 chmod 0600 "$temporary_file"

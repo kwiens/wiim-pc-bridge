@@ -4,9 +4,9 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 import re
 import tempfile
+from pathlib import Path
 
 from bridge_config import CONFIG, PROJECT
 

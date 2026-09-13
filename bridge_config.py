@@ -2,12 +2,38 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import ipaddress
 import os
+import re
+from dataclasses import dataclass
 from pathlib import Path
 
-
 PROJECT = Path(__file__).resolve().parent
+KEY_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
+KNOWN_KEYS = frozenset(
+    {
+        "BRIDGE_FRIENDLY_NAME",
+        "BRIDGE_GID",
+        "BRIDGE_RUNTIME_DIR",
+        "BRIDGE_SINK",
+        "BRIDGE_UID",
+        "DISPLAYPORT_SINK",
+        "KITCHEN_DEVICE_NAME",
+        "KITCHEN_IP",
+        "LIVING_ROOM_DEVICE_NAME",
+        "LIVING_ROOM_IP",
+        "LOCAL_OFFSET_MS",
+        "LOCAL_OUTPUT_NAME",
+        "LOCAL_VOLUME",
+        "PULSE_COOKIE_PATH",
+        "SOLOIST_KEY_FILE",
+        "START_BUFFER_MS",
+        "TRUSTED_NETWORK",
+        "WIIM_OFFSET_MS",
+        "WIIM_OUTPUT_NAME",
+        "WIIM_VOLUME",
+    }
+)
 
 
 def _read_env_file(path: Path) -> dict[str, str]:
@@ -24,6 +50,16 @@ def _read_env_file(path: Path) -> dict[str, str]:
             raise ValueError(f"invalid configuration at {path}:{line_number}")
         key, value = line.split("=", 1)
         key = key.strip()
+        if not KEY_PATTERN.fullmatch(key):
+            raise ValueError(f"invalid configuration key at {path}:{line_number}")
+        if key not in KNOWN_KEYS:
+            raise ValueError(
+                f"unknown configuration key at {path}:{line_number}: {key}"
+            )
+        if key in values:
+            raise ValueError(
+                f"duplicate configuration key at {path}:{line_number}: {key}"
+            )
         value = value.strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
             value = value[1:-1]
@@ -74,9 +110,7 @@ def load_config() -> BridgeConfig:
     config = BridgeConfig(
         uid=uid,
         gid=_integer(values, "BRIDGE_GID", os.getgid()),
-        runtime_dir=Path(
-            _value(values, "BRIDGE_RUNTIME_DIR", f"/run/user/{uid}")
-        ),
+        runtime_dir=Path(_value(values, "BRIDGE_RUNTIME_DIR", f"/run/user/{uid}")),
         soloist_key_file=Path(
             _value(
                 values,
@@ -103,9 +137,7 @@ def load_config() -> BridgeConfig:
         wiim_output_name=_value(
             values, "WIIM_OUTPUT_NAME", "WiiM group (Kitchen leader)"
         ),
-        local_output_name=_value(
-            values, "LOCAL_OUTPUT_NAME", "This PC DisplayPort"
-        ),
+        local_output_name=_value(values, "LOCAL_OUTPUT_NAME", "This PC DisplayPort"),
         trusted_network=_value(values, "TRUSTED_NETWORK", "192.0.2.0/24"),
         local_volume=_integer(values, "LOCAL_VOLUME", 100),
         wiim_volume=_integer(values, "WIIM_VOLUME", 50),
@@ -125,6 +157,50 @@ def load_config() -> BridgeConfig:
     ):
         if not -2000 <= offset <= 2000:
             raise ValueError(f"{name} must be between -2000 and 2000")
+    if config.uid < 0 or config.gid < 0:
+        raise ValueError("BRIDGE_UID and BRIDGE_GID must be non-negative")
+    for name, path in (
+        ("BRIDGE_RUNTIME_DIR", config.runtime_dir),
+        ("SOLOIST_KEY_FILE", config.soloist_key_file),
+        ("PULSE_COOKIE_PATH", config.pulse_cookie_path),
+    ):
+        if not path.is_absolute():
+            raise ValueError(f"{name} must be an absolute path")
+    for name, value in (
+        ("DISPLAYPORT_SINK", config.displayport_sink),
+        ("BRIDGE_SINK", config.bridge_sink),
+        ("BRIDGE_FRIENDLY_NAME", config.friendly_name),
+        ("KITCHEN_DEVICE_NAME", config.kitchen_device_name),
+        ("LIVING_ROOM_DEVICE_NAME", config.living_room_device_name),
+        ("WIIM_OUTPUT_NAME", config.wiim_output_name),
+        ("LOCAL_OUTPUT_NAME", config.local_output_name),
+    ):
+        if not value:
+            raise ValueError(f"{name} must not be empty")
+    for name, value in (
+        ("DISPLAYPORT_SINK", config.displayport_sink),
+        ("BRIDGE_SINK", config.bridge_sink),
+    ):
+        if any(character.isspace() for character in value):
+            raise ValueError(f"{name} must not contain whitespace")
+    try:
+        kitchen = ipaddress.ip_address(config.kitchen_ip)
+        living_room = ipaddress.ip_address(config.living_room_ip)
+        trusted_network = ipaddress.ip_network(config.trusted_network, strict=False)
+    except ValueError as exc:
+        raise ValueError(
+            "WiiM addresses and TRUSTED_NETWORK must be valid IP values"
+        ) from exc
+    if kitchen.version != 4 or living_room.version != 4:
+        raise ValueError("WiiM addresses must currently be IPv4")
+    if kitchen == living_room:
+        raise ValueError("KITCHEN_IP and LIVING_ROOM_IP must be different")
+    if trusted_network.version != 4:
+        raise ValueError("TRUSTED_NETWORK must currently be IPv4")
+    if kitchen not in trusted_network or living_room not in trusted_network:
+        raise ValueError("both WiiM addresses must be inside TRUSTED_NETWORK")
+    if not 250 <= config.start_buffer_ms <= 10000:
+        raise ValueError("START_BUFFER_MS must be between 250 and 10000")
     return config
 
 

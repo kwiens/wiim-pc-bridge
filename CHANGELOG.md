@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.0.1 - 2026-09-13
+
+- Validate configuration structure, paths, volumes, offsets, buffer bounds, and
+  WiiM membership in the trusted LAN.
+- Apply output levels before connecting, preventing stale cached volume bursts.
+- Detect duplicate or extra selected OwnTone outputs in the health audit.
+- Roll back Soloist manifest pins and the running container after a failed
+  update.
+- Wait for every container health check during systemd startup.
+- Add Ruff, Bandit, and YAML validation to CI.
+
 ## v1.0.0 - 2026-09-13
 
 - Route Spotify Soloist through an isolated PipeWire sink and supervised PCM

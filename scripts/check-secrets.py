@@ -3,11 +3,13 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 import re
-import subprocess
+import shutil
+import subprocess  # nosec B404
 import sys
+from pathlib import Path
 
+# subprocess invokes a resolved Git executable with fixed argv and no shell.
 
 PROJECT = Path(__file__).resolve().parents[1]
 PATTERNS = {
@@ -19,9 +21,12 @@ PATTERNS = {
 
 
 def candidate_paths() -> list[Path]:
-    completed = subprocess.run(
+    git = shutil.which("git")
+    if git is None:
+        raise RuntimeError("git is required for the credential scan")
+    completed = subprocess.run(  # nosec B603
         [
-            "git",
+            git,
             "ls-files",
             "--cached",
             "--others",

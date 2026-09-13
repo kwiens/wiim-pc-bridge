@@ -1,3 +1,4 @@
+---
 name: CI
 
 on:
@@ -12,19 +13,41 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: "3.12"
+      - name: Install pinned linters
+        run: python -m pip install --requirement requirements-dev.txt
       - name: Prepare example configuration
         run: cp .env.example .env
       - name: Python tests
         run: python -m unittest discover -s tests -v
       - name: Python syntax
         run: python -m compileall -q bridge.py bridge_config.py doctor.py render-config.py tests
+      - name: Python lint and formatting
+        run: |
+          ruff check .
+          ruff format --check .
+      - name: Python security scan
+        run: >-
+          bandit -q -r bridge.py bridge_config.py doctor.py render-config.py
+          scripts/check-secrets.py
+      - name: YAML lint
+        run: yamllint .github compose.yaml
       - name: Compose validation
         run: docker compose --env-file .env.example config --quiet
+      - name: Dockerfile lint
+        run: >-
+          docker run --rm -i
+          hadolint/hadolint@sha256:a1d49ae1a4e83c1dbad26b8c1ad7588c8bd1e04f4866b34ad3cac50335198552
+          < Dockerfile.soloist
       - name: Shell validation
-        run: shellcheck ensure-runtime.sh install-service.sh save-soloist-key.sh soloist-entrypoint.sh update-soloist.sh
+        run: >-
+          docker run --rm -v "$PWD:/mnt:ro"
+          koalaman/shellcheck@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d
+          /mnt/ensure-runtime.sh /mnt/install-service.sh
+          /mnt/save-soloist-key.sh /mnt/soloist-entrypoint.sh
+          /mnt/update-soloist.sh
       - name: Credential scan
         run: python scripts/check-secrets.py

@@ -36,7 +36,9 @@ mkdir -p \
 chmod 0700 \
   "$project_directory/cache/soloist/data" \
   "$project_directory/cache/soloist/cache" \
-  "$project_key_directory"
+  "$project_key_directory" \
+  "$project_directory/runtime"
+chmod 0600 "$config_file"
 
 if [ -e "$audio_fifo" ] && [ ! -p "$audio_fifo" ]; then
   echo "$audio_fifo exists but is not a named pipe." >&2

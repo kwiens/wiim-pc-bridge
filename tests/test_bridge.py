@@ -23,6 +23,16 @@ def healthy_wiim_response(ip: str, command: str) -> dict[str, object]:
 
 
 class BridgeGuardTests(unittest.TestCase):
+    @mock.patch.object(bridge.urllib.request, "urlopen")
+    def test_malformed_owntone_json_has_a_concise_error(
+        self, urlopen: mock.Mock
+    ) -> None:
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b"{"
+        urlopen.return_value = response
+        with self.assertRaisesRegex(bridge.BridgeError, "malformed JSON"):
+            bridge.request("/outputs")
+
     @mock.patch.object(bridge, "wiim_request", side_effect=healthy_wiim_response)
     def test_expected_native_group_is_accepted(self, _request: mock.Mock) -> None:
         bridge.validate_wiim_group()
@@ -43,6 +53,11 @@ class BridgeGuardTests(unittest.TestCase):
         ]
         result = bridge.find_output(items, bridge.WIIM_NAME, "AirPlay 2")
         self.assertEqual(result["id"], "right")
+
+    def test_output_without_id_is_rejected(self) -> None:
+        items = [{"name": bridge.LOCAL_NAME, "type": "AirPlay 1"}]
+        with self.assertRaisesRegex(bridge.BridgeError, "missing its id"):
+            bridge.find_output(items, bridge.LOCAL_NAME, "AirPlay 1")
 
     @mock.patch.object(bridge, "request")
     def test_volume_uses_the_documented_per_output_endpoint(
@@ -107,12 +122,26 @@ class BridgeGuardTests(unittest.TestCase):
             },
         ]
         outputs.side_effect = [desired, desired]
+        actions = mock.Mock()
+        actions.attach_mock(set_volume, "volume")
+        actions.attach_mock(set_offset, "offset")
+        actions.attach_mock(set_outputs, "select")
 
         bridge.reconcile_once()
 
         set_outputs.assert_called_once_with(desired)
         self.assertEqual(set_volume.call_count, 2)
         self.assertEqual(set_offset.call_count, 2)
+        self.assertEqual(
+            actions.mock_calls,
+            [
+                mock.call.volume(desired[0], bridge.CONFIG.local_volume),
+                mock.call.volume(desired[1], bridge.CONFIG.wiim_volume),
+                mock.call.offset(desired[0], bridge.CONFIG.local_offset_ms),
+                mock.call.offset(desired[1], bridge.CONFIG.wiim_offset_ms),
+                mock.call.select(desired),
+            ],
+        )
 
 
 if __name__ == "__main__":

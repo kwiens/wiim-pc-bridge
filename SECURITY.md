@@ -13,3 +13,14 @@ Before publishing a fork or changing this repository from private to public:
 This project passes a Spotify Soloist API key to the Soloist process. It stores
 that key only in a mode-600 file outside Git and exposes it to the container as
 a Docker Compose secret.
+
+Soloist currently accepts its API key only as a command-line option. The key is
+therefore visible inside the container's process table. Treat membership in the
+host's Docker group as root-equivalent and do not grant untrusted users Docker
+access.
+
+WiiM's local control API presents a self-signed HTTPS certificate. The bridge
+therefore cannot validate a public certificate chain. Configuration validation
+restricts both device destinations to literal IPv4 addresses inside the
+explicitly trusted LAN configured by `TRUSTED_NETWORK`; do not set that network
+broader than necessary.
