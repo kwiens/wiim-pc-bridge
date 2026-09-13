@@ -1,14 +1,14 @@
 #!/bin/sh
 set -eu
 
-project_directory=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+project_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 config_file=${WIIM_BRIDGE_ENV:-$project_directory/.env}
 if [ ! -f "$config_file" ]; then
   echo "Missing $config_file; copy .env.example to .env and edit it." >&2
   exit 1
 fi
 # The local configuration is shell-compatible and trusted by this user.
-# shellcheck source=/dev/null
+# shellcheck disable=SC1090
 set -a
 . "$config_file"
 set +a

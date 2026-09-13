@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-project_directory=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+project_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 archive_url=https://soloist-builds.spotifycdn.com/soloist_release_x86_64.tar.gz
 action=${1:---check}
 

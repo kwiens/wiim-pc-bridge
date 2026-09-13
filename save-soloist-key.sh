@@ -1,10 +1,10 @@
 #!/bin/sh
 set -eu
 
-project_directory=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+project_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 config_file=${WIIM_BRIDGE_ENV:-$project_directory/.env}
 if [ -f "$config_file" ]; then
-  # shellcheck source=/dev/null
+  # shellcheck disable=SC1090
   set -a
   . "$config_file"
   set +a

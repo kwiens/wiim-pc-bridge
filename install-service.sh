@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-project_directory=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+project_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 template="$project_directory/systemd/wiim-pc-bridge.service.in"
 unit_directory=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
 unit_file="$unit_directory/wiim-pc-bridge.service"

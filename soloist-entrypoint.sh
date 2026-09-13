@@ -1,4 +1,6 @@
 #!/bin/sh
+# ShellCheck cannot see that POSIX traps invoke these handlers.
+# shellcheck disable=SC2317
 set -eu
 
 api_key_file=/run/secrets/soloist_api_key
