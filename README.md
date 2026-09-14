@@ -147,22 +147,43 @@ Positive offsets delay that output; valid offsets are -2000 through 2000 ms.
 | `DISPLAYPORT_SINK` | Stable PipeWire sink used by the local Shairport stream |
 | `KITCHEN_IP`, `LIVING_ROOM_IP` | Reserved addresses used for fail-closed topology checks |
 | `KITCHEN_DEVICE_NAME` | AirPlay service name advertised by the WiiM leader |
+| `WIIM_FOLLOWERS` | Optional `ADDRESS=Name` list for groups with more than one follower |
+| `TRUSTED_NETWORK` | Private `/8`, `/16` or `/24` allowed to control OwnTone |
 | `LOCAL_OUTPUT_NAME`, `WIIM_OUTPUT_NAME` | Exact OwnTone output identities |
 | `LOCAL_VOLUME`, `WIIM_VOLUME` | Levels restored by reconciliation |
 | `LOCAL_OFFSET_MS`, `WIIM_OFFSET_MS` | Per-output synchronization adjustments |
 
 `ensure-runtime.sh` renders `runtime/owntone.conf` from `owntone.conf.in` on
-every start. Runtime state and configuration are not committed.
+every start, writing through the existing file so a running OwnTone container
+picks the change up on its next restart. Runtime state is not committed.
 
-The Soloist key is authoritative at the path configured by
-`SOLOIST_KEY_FILE`. An ignored, mode-600 project backup is maintained at
-`.secrets/soloist_api_key`. Neither file belongs in Git or the Docker build
-context.
+`TRUSTED_NETWORK` is the LAN permitted to control OwnTone without
+authentication. OwnTone matches it on whole dotted octets rather than on CIDR,
+so the value must be a private `/8`, `/16` or `/24` with no host bits set; both
+WiiM addresses must fall inside it. Keep it no broader than necessary.
+
+By default the group is one leader and one follower, taken from the
+`KITCHEN_*` and `LIVING_ROOM_*` settings. Set `WIIM_FOLLOWERS` to run any other
+number:
+
+```bash
+WIIM_FOLLOWERS=192.168.1.11=Living Room,192.168.1.12=Patio
+```
+
+Reconciliation compares the leader's reported followers against exactly this
+set and refuses to select the WiiM output on any mismatch, naming what is
+missing and what is unexpected.
+
+The Soloist key lives only at the path configured by `SOLOIST_KEY_FILE`, which
+must be outside the clone; configuration validation rejects a path inside it so
+the key cannot be committed by a stray `git add -A`.
 
 ## Reliability model
 
 - Image bases and third-party images are pinned by digest.
-- Soloist is forced to a private `wiim_bridge` PipeWire sink.
+- Soloist is routed to a private `wiim_bridge` PipeWire sink, and the
+  entrypoint refuses to capture from a pre-existing sink of that name whose
+  format does not match.
 - PCM capture uses 44.1 kHz signed 16-bit stereo and a tested 100 ms fragment.
 - OwnTone uses a configurable 2250 ms startup buffer by default.
 - The Soloist entrypoint supervises both Soloist and `parec`; either child
@@ -225,7 +246,10 @@ docker compose --env-file .env.example config --quiet
 ./scripts/check-secrets.py
 ```
 
-OwnTone's local web interface is available at <http://127.0.0.1:3689>.
+OwnTone's local web interface is available at <http://127.0.0.1:3689>. The
+containers use host networking, so that port is reachable from the whole LAN
+and is gated only by `TRUSTED_NETWORK`. OwnTone's unauthenticated MPD control
+server is disabled outright.
 
 See [SECURITY.md](SECURITY.md) before making a fork public.
 

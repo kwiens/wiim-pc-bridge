@@ -7,8 +7,8 @@ services:
     container_name: wiim-pc-bridge-owntone
     network_mode: host
     environment:
-      UID: "${BRIDGE_UID:-1000}"
-      GID: "${BRIDGE_GID:-1000}"
+      UID: "${BRIDGE_UID:?Set BRIDGE_UID in .env}"
+      GID: "${BRIDGE_GID:?Set BRIDGE_GID in .env}"
     volumes:
       - ./runtime/owntone.conf:/etc/owntone/owntone.conf:ro
       - ./media:/srv/media
@@ -24,14 +24,14 @@ services:
       # cookie. Pinning the sink avoids following a later desktop default.
       PULSE_SINK: "${DISPLAYPORT_SINK:?Set DISPLAYPORT_SINK in .env}"
     volumes:
-      - ${BRIDGE_RUNTIME_DIR:-/run/user/1000}/pulse/native:/tmp/pulseaudio.socket
+      - ${BRIDGE_RUNTIME_DIR:?set it in .env}/pulse/native:/tmp/pulseaudio.socket
       - ${PULSE_COOKIE_PATH:?Set PULSE_COOKIE_PATH in .env}:/tmp/pulseaudio.cookie:ro
     cap_add:
       - SYS_NICE
     command:
       - -v
       - -a
-      - "${LOCAL_OUTPUT_NAME:-This PC DisplayPort}"
+      - "${LOCAL_OUTPUT_NAME:?Set LOCAL_OUTPUT_NAME in .env}"
       # The local receiver uses NTP-timed classic AirPlay, which OwnTone can
       # synchronize with the Kitchen AirPlay 2 output.
       # Keep this as one argument: the image startup script uses this exact
@@ -54,19 +54,19 @@ services:
     image: wiim-pc-bridge/soloist:1.3.8.36-20260911
     container_name: wiim-pc-bridge-soloist
     network_mode: host
-    user: "${BRIDGE_UID:-1000}:${BRIDGE_GID:-1000}"
+    user: "${BRIDGE_UID:?Set BRIDGE_UID in .env}:${BRIDGE_GID:?Set BRIDGE_GID in .env}"
     environment:
-      XDG_RUNTIME_DIR: "${BRIDGE_RUNTIME_DIR:-/run/user/1000}"
-      PULSE_SERVER: "unix:${BRIDGE_RUNTIME_DIR:-/run/user/1000}/pulse/native"
+      XDG_RUNTIME_DIR: "${BRIDGE_RUNTIME_DIR:?set it in .env}"
+      PULSE_SERVER: "unix:${BRIDGE_RUNTIME_DIR:?set it in .env}/pulse/native"
       # Soloist currently uses the PipeWire Pulse compatibility server. This
       # variable is the authoritative route; --pipewire-device alone falls
       # back to the host default with this build.
-      PULSE_SINK: "${BRIDGE_SINK:-wiim_bridge}"
-      BRIDGE_SINK: "${BRIDGE_SINK:-wiim_bridge}"
-      SOLOIST_DEVICE_NAME: "${BRIDGE_FRIENDLY_NAME:-PC + WiiM}"
+      PULSE_SINK: "${BRIDGE_SINK:?Set BRIDGE_SINK in .env}"
+      BRIDGE_SINK: "${BRIDGE_SINK:?Set BRIDGE_SINK in .env}"
+      SOLOIST_DEVICE_NAME: "${BRIDGE_FRIENDLY_NAME:?Set BRIDGE_FRIENDLY_NAME in .env}"
     volumes:
-      - ${BRIDGE_RUNTIME_DIR:-/run/user/1000}/pipewire-0:${BRIDGE_RUNTIME_DIR:-/run/user/1000}/pipewire-0
-      - ${BRIDGE_RUNTIME_DIR:-/run/user/1000}/pulse/native:${BRIDGE_RUNTIME_DIR:-/run/user/1000}/pulse/native
+      - ${BRIDGE_RUNTIME_DIR:?set it in .env}/pipewire-0:${BRIDGE_RUNTIME_DIR:?set it in .env}/pipewire-0
+      - ${BRIDGE_RUNTIME_DIR:?set it in .env}/pulse/native:${BRIDGE_RUNTIME_DIR:?set it in .env}/pulse/native
       - ./media:/srv/media
       - ./cache/soloist/data:/var/lib/soloist
       - ./cache/soloist/cache:/var/cache/soloist

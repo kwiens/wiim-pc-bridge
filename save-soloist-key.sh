@@ -3,17 +3,24 @@ set -eu
 
 project_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 config_file=${WIIM_BRIDGE_ENV:-$project_directory/.env}
+
+# Resolve the key path through the same strict parser the other tools use,
+# rather than sourcing .env, which would execute it.
+key_file=""
 if [ -f "$config_file" ]; then
-  set -a
-  # shellcheck disable=SC1090
-  . "$config_file"
-  set +a
+  if ! exported=$("$project_directory/render-config.py" --export); then
+    echo "Could not read $config_file; see the error above." >&2
+    exit 1
+  fi
+  # shellcheck disable=SC2154  # SOLOIST_KEY_FILE is set by the eval above.
+  eval "$exported"
+  key_file=$SOLOIST_KEY_FILE
+fi
+if [ -z "$key_file" ]; then
+  key_file=$HOME/.config/wiim-pc-bridge/soloist_api_key
 fi
 
-key_file=${SOLOIST_KEY_FILE:-$HOME/.config/wiim-pc-bridge/soloist_api_key}
 key_directory=$(dirname -- "$key_file")
-project_key_directory="$project_directory/.secrets"
-project_key_file="$project_key_directory/soloist_api_key"
 temporary_file=""
 terminal_state=""
 
@@ -39,7 +46,12 @@ fi
 printf 'Paste the Spotify Soloist API key (input is hidden): ' >&2
 terminal_state=$(stty -g)
 stty -echo
-IFS= read -r api_key
+# `read` returns non-zero at EOF (Ctrl-D). Without this guard `set -e` would
+# abort here and the user would see no explanation at all.
+api_key=""
+if ! IFS= read -r api_key; then
+  api_key=""
+fi
 stty "$terminal_state"
 terminal_state=""
 printf '\n' >&2
@@ -57,13 +69,16 @@ case "$api_key" in
 esac
 
 umask 077
-mkdir -p "$key_directory"
-chmod 0700 "$key_directory"
+# Only create and lock down a directory this script owns. `key_directory` is
+# whatever the user configured, so chmod-ing it unconditionally could relock an
+# unrelated directory -- $HOME, for instance, if the key sits directly in it.
+if [ ! -d "$key_directory" ]; then
+  mkdir -p "$key_directory"
+  chmod 0700 "$key_directory"
+fi
 temporary_file=$(mktemp "$key_directory/.soloist_api_key.XXXXXX")
 printf '%s\n' "$api_key" > "$temporary_file"
 chmod 0600 "$temporary_file"
 mv -f "$temporary_file" "$key_file"
 temporary_file=""
-install -d -m 0700 "$project_key_directory"
-install -m 0600 "$key_file" "$project_key_file"
-echo "Saved the private home key and ignored project backup with mode 600."
+echo "Saved the Soloist API key to $key_file with mode 600."

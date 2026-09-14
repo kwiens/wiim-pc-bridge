@@ -12,6 +12,8 @@ initial_volume=40
 module_id=""
 capture_pid=""
 soloist_pid=""
+stop_requested=0
+capture_ready_timeout=30
 
 cleanup() {
   if [ -n "$capture_pid" ]; then
@@ -25,9 +27,15 @@ cleanup() {
 }
 
 forward_signal() {
+  stop_requested=1
   if [ -n "$soloist_pid" ]; then
     kill -TERM "$soloist_pid" 2>/dev/null || true
+    return
   fi
+  # No child exists yet. Trapping replaced the default terminate action, so
+  # without this the script would ignore the stop and go on to start Soloist.
+  echo "Stop requested before startup finished; exiting." >&2
+  exit 143
 }
 
 trap cleanup EXIT
@@ -83,7 +91,24 @@ until pactl info >/dev/null 2>&1; do
 done
 
 # Create an isolated 44.1 kHz sink without changing the host's default output.
-if ! pactl list short sinks | awk '{print $2}' | grep -Fxq "$sink_name"; then
+if pactl list short sinks | awk '{print $2}' | grep -Fxq "$sink_name"; then
+  # A sink of this name already exists: a leaked module from a container that
+  # was killed, or an unrelated host sink. Adopting it blindly would let parec
+  # capture whatever that sink renders, so verify it carries the format this
+  # bridge depends on.
+  existing_spec=$(pactl list short sinks \
+    | awk -v name="$sink_name" '$2 == name {print $4 " " $5}')
+  case "$existing_spec" in
+    "s16le 2ch"*)
+      echo "Reusing the existing $sink_name sink ($existing_spec)." >&2
+      ;;
+    *)
+      echo "A sink named $sink_name already exists with an unexpected format" \
+        "($existing_spec); refusing to capture from it." >&2
+      exit 1
+      ;;
+  esac
+else
   module_id=$(pactl load-module module-null-sink \
     sink_name="$sink_name" \
     format=s16le \
@@ -105,6 +130,25 @@ parec \
 capture_pid=$!
 echo "$capture_pid" > /tmp/parec.pid
 
+# Opening a FIFO for writing blocks until a reader appears, so until OwnTone
+# opens the pipe this PID is still the forked shell, not parec. Without this
+# gate `kill -0` would report a live capture and the health check would go
+# green while no PCM is flowing at all.
+attempt=0
+until [ "$(cat "/proc/$capture_pid/comm" 2>/dev/null || true)" = parec ]; do
+  if ! kill -0 "$capture_pid" 2>/dev/null; then
+    echo "PCM capture exited before it started" >&2
+    exit 1
+  fi
+  attempt=$((attempt + 1))
+  if [ "$attempt" -ge "$capture_ready_timeout" ]; then
+    echo "No reader opened $audio_fifo after ${capture_ready_timeout}s;" \
+      "OwnTone is not consuming the bridge pipe." >&2
+    exit 1
+  fi
+  sleep 1
+done
+
 /usr/local/bin/soloist \
   --device-name "$device_name" \
   --api-key "$api_key" \
@@ -116,6 +160,10 @@ echo "$capture_pid" > /tmp/parec.pid
   --ws 127.0.0.1:9090 &
 soloist_pid=$!
 echo "$soloist_pid" > /tmp/soloist-child.pid
+
+if [ "$stop_requested" -eq 1 ]; then
+  kill -TERM "$soloist_pid" 2>/dev/null || true
+fi
 
 # Supervise both children. Docker only restarts a container when PID 1 exits;
 # a healthcheck alone does not recover a dead capture process.
@@ -133,5 +181,14 @@ fi
 set +e
 wait "$soloist_pid"
 status=$?
+# A trapped signal interrupts `wait`, which returns 128+signal WITHOUT reaping
+# the child. Exiting here would drop PID 1 while Soloist is still flushing its
+# bind-mounted state, and the kernel would SIGKILL it a few milliseconds into
+# the shutdown, making stop_grace_period useless. Keep waiting until it is
+# really gone.
+while [ "$status" -gt 128 ] && kill -0 "$soloist_pid" 2>/dev/null; do
+  wait "$soloist_pid"
+  status=$?
+done
 set -e
 exit "$status"

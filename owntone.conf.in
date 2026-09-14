@@ -4,6 +4,7 @@ general {
 	db_backup_path = "/var/cache/owntone/database.bak"
 	logfile = "/dev/stderr"
 	loglevel = info
+	# Dotted-octet prefixes, not CIDR: OwnTone compares address text.
 	trusted_networks = { "127.0.0.1", "@TRUSTED_NETWORK@" }
 	ipv6 = no
 	start_buffer_ms = @START_BUFFER_MS@
@@ -38,8 +39,12 @@ airplay "@LOCAL_OUTPUT_NAME@" {
 	nickname = "@LOCAL_OUTPUT_NAME@"
 }
 
+# OwnTone's MPD server has no authentication and these containers use host
+# networking, so leaving it enabled would expose unauthenticated playback
+# control to the whole LAN. `port = 0` disables the protocol server itself;
+# `http_port = 0` only disables its HTTP stream.
 mpd {
-	port = 6600
+	port = 0
 	http_port = 0
 }
 

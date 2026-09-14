@@ -7,21 +7,23 @@ if [ ! -f "$config_file" ]; then
   echo "Missing $config_file; copy .env.example to .env and edit it." >&2
   exit 1
 fi
-# The local configuration is shell-compatible and trusted by this user.
-set -a
-# shellcheck disable=SC1090
-. "$config_file"
-set +a
 
-bridge_uid=${BRIDGE_UID:-$(id -u)}
-runtime_directory=${BRIDGE_RUNTIME_DIR:-/run/user/$bridge_uid}
-home_key=${SOLOIST_KEY_FILE:-$HOME/.config/wiim-pc-bridge/soloist_api_key}
-project_key_directory="$project_directory/.secrets"
-project_key="$project_key_directory/soloist_api_key"
+# Read the configuration through the single strict parser rather than sourcing
+# it. Sourcing executes the file, so a value Docker Compose treats literally --
+# parentheses, $VAR, backticks -- would be expanded or would abort the script,
+# and the shell would silently disagree with the Python tools about the same
+# line. --export emits shell-quoted assignments from the validated config.
+if ! exported=$("$project_directory/render-config.py" --export); then
+  echo "Could not read $config_file; see the error above." >&2
+  exit 1
+fi
+# shellcheck disable=SC2154  # BRIDGE_UID and friends are set by the eval above.
+eval "$exported"
+
 audio_fifo="$project_directory/media/spotify.pcm"
 
-if [ "$(id -u)" -ne "$bridge_uid" ]; then
-  echo "Run this setup as the configured uid $bridge_uid, not as $(id -u)." >&2
+if [ "$(id -u)" -ne "$BRIDGE_UID" ]; then
+  echo "Run this setup as the configured uid $BRIDGE_UID, not as $(id -u)." >&2
   exit 1
 fi
 
@@ -31,12 +33,10 @@ mkdir -p \
   "$project_directory/cache/owntone" \
   "$project_directory/cache/soloist/data" \
   "$project_directory/cache/soloist/cache" \
-  "$project_key_directory" \
   "$project_directory/runtime"
 chmod 0700 \
   "$project_directory/cache/soloist/data" \
   "$project_directory/cache/soloist/cache" \
-  "$project_key_directory" \
   "$project_directory/runtime"
 chmod 0600 "$config_file"
 
@@ -49,14 +49,13 @@ if [ ! -p "$audio_fifo" ]; then
 fi
 chmod 0660 "$audio_fifo"
 
-if [ ! -s "$home_key" ]; then
+if [ ! -s "$SOLOIST_KEY_FILE" ]; then
   echo "Soloist API key is missing; run ./save-soloist-key.sh first." >&2
   exit 1
 fi
-chmod 0600 "$home_key"
-install -m 0600 "$home_key" "$project_key"
+chmod 0600 "$SOLOIST_KEY_FILE"
 
-if [ ! -f "${PULSE_COOKIE_PATH:?Set PULSE_COOKIE_PATH in .env}" ]; then
+if [ ! -f "$PULSE_COOKIE_PATH" ]; then
   echo "Pulse cookie is missing: $PULSE_COOKIE_PATH" >&2
   exit 1
 fi
@@ -73,11 +72,11 @@ until docker info >/dev/null 2>&1; do
   sleep 2
 done
 
-export XDG_RUNTIME_DIR="$runtime_directory"
-export PULSE_SERVER="unix:$runtime_directory/pulse/native"
+export XDG_RUNTIME_DIR="$BRIDGE_RUNTIME_DIR"
+export PULSE_SERVER="unix:$BRIDGE_RUNTIME_DIR/pulse/native"
 attempt=0
-until [ -S "$runtime_directory/pipewire-0" ] \
-  && [ -S "$runtime_directory/pulse/native" ] \
+until [ -S "$BRIDGE_RUNTIME_DIR/pipewire-0" ] \
+  && [ -S "$BRIDGE_RUNTIME_DIR/pulse/native" ] \
   && pactl info >/dev/null 2>&1; do
   attempt=$((attempt + 1))
   if [ "$attempt" -ge 60 ]; then
@@ -87,8 +86,7 @@ until [ -S "$runtime_directory/pipewire-0" ] \
   sleep 1
 done
 
-if ! pactl list short sinks | awk '{print $2}' \
-  | grep -Fxq "${DISPLAYPORT_SINK:?Set DISPLAYPORT_SINK in .env}"; then
+if ! pactl list short sinks | awk '{print $2}' | grep -Fxq "$DISPLAYPORT_SINK"; then
   echo "Configured DisplayPort sink is unavailable: $DISPLAYPORT_SINK" >&2
   exit 1
 fi

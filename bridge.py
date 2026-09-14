@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import ssl
 import sys
@@ -12,17 +13,39 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from bridge_config import CONFIG
+from bridge_config import (
+    OFFSET_RANGE_MS,
+    VOLUME_RANGE,
+    ConfigError,
+    get_config,
+)
 
 API = "http://127.0.0.1:3689/api"
-LOCAL_NAME = CONFIG.local_output_name
-WIIM_NAME = CONFIG.wiim_output_name
-KITCHEN_IP = CONFIG.kitchen_ip
-LIVING_ROOM_IP = CONFIG.living_room_ip
+LOCAL_TYPE = "AirPlay 1"
+WIIM_TYPE = "AirPlay 2"
+TIMEOUT_SECONDS = 5
+
+# Errors raised while reading a response body are not wrapped into URLError by
+# urllib, so they have to be named explicitly or they escape as tracebacks.
+TRANSPORT_ERRORS = (
+    urllib.error.URLError,
+    http.client.HTTPException,
+    OSError,
+)
 
 
 class BridgeError(RuntimeError):
     pass
+
+
+def target_output(target: str) -> tuple[str, str]:
+    """Map a CLI target onto the OwnTone output name and type it selects."""
+    config = get_config()
+    if target == "local":
+        return config.local_output_name, LOCAL_TYPE
+    if target == "wiim":
+        return config.wiim_output_name, WIIM_TYPE
+    raise BridgeError(f"unknown target {target!r}")
 
 
 def request(
@@ -37,9 +60,11 @@ def request(
     req = urllib.request.Request(API + path, data=data, headers=headers, method=method)
     try:
         # API is a fixed loopback HTTP origin; caller controls only its path.
-        with urllib.request.urlopen(req, timeout=5) as response:  # nosec B310
+        with urllib.request.urlopen(  # nosec B310
+            req, timeout=TIMEOUT_SECONDS
+        ) as response:
             body = response.read()
-    except urllib.error.URLError as exc:
+    except TRANSPORT_ERRORS as exc:
         raise BridgeError(f"OwnTone API request failed: {exc}") from exc
 
     if not body:
@@ -63,43 +88,76 @@ def wiim_request(ip: str, command: str) -> dict[str, object]:
         f"https://{ip}/httpapi.asp?command={encoded}", method="GET"
     )
     # WiiM devices use self-signed LAN certificates. The destination is a
-    # validated, configured IPv4 address inside TRUSTED_NETWORK.
+    # validated, configured IPv4 address inside the private TRUSTED_NETWORK.
     context = ssl._create_unverified_context()  # nosec B323
     try:
         with urllib.request.urlopen(  # nosec B310
-            req, timeout=5, context=context
+            req, timeout=TIMEOUT_SECONDS, context=context
         ) as response:
             payload = json.load(response)
-    except (urllib.error.URLError, json.JSONDecodeError) as exc:
+    except TRANSPORT_ERRORS as exc:
         raise BridgeError(f"WiiM request failed for {ip}: {exc}") from exc
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise BridgeError(f"WiiM {ip} returned malformed JSON") from exc
     if not isinstance(payload, dict):
         raise BridgeError(f"WiiM {ip} returned an unexpected response")
     return payload
 
 
+def reported_followers(leader_ip: str) -> set[tuple[str, str]]:
+    """Return the (address, name) pairs the leader says it is driving."""
+    response = wiim_request(leader_ip, "multiroom:getSlaveList")
+    entries = response.get("slave_list")
+    if not isinstance(entries, list):
+        raise BridgeError(f"WiiM {leader_ip} returned no follower list")
+    followers: set[tuple[str, str]] = set()
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        ip, name = item.get("ip"), item.get("name")
+        if isinstance(ip, str) and isinstance(name, str):
+            followers.add((ip, name))
+    return followers
+
+
+def describe(members: set[tuple[str, str]]) -> str:
+    return ", ".join(f"{name} ({ip})" for ip, name in sorted(members)) or "none"
+
+
 def validate_wiim_group() -> None:
-    kitchen = wiim_request(KITCHEN_IP, "getStatusEx")
-    living = wiim_request(LIVING_ROOM_IP, "getStatusEx")
-    followers = wiim_request(KITCHEN_IP, "multiroom:getSlaveList")
-    follower_list = followers.get("slave_list")
-    expected_follower = isinstance(follower_list, list) and any(
-        isinstance(item, dict)
-        and item.get("ip") == LIVING_ROOM_IP
-        and item.get("name") == CONFIG.living_room_device_name
-        for item in follower_list
-    )
-    if not (
-        str(kitchen.get("group")) == "0"
-        and str(living.get("group")) == "1"
-        and living.get("master_ip") == KITCHEN_IP
-        and followers.get("slaves") == 1
-        and expected_follower
-    ):
+    """Fail closed unless the native group exactly matches the configuration."""
+    config = get_config()
+    leader = wiim_request(config.kitchen_ip, "getStatusEx")
+    if str(leader.get("group")) != "0":
         raise BridgeError(
-            f"WiiM group is not {CONFIG.kitchen_device_name} leader -> "
-            f"{CONFIG.living_room_device_name} follower; refusing to select "
+            f"{config.kitchen_device_name} ({config.kitchen_ip}) is not acting as "
+            "the group leader; refusing to select the WiiM output"
+        )
+
+    expected = set(config.followers)
+    reported = reported_followers(config.kitchen_ip)
+    if reported != expected:
+        missing = describe(expected - reported)
+        unexpected = describe(reported - expected)
+        raise BridgeError(
+            f"{config.kitchen_device_name} is not leading the configured group; "
+            f"missing: {missing}; unexpected: {unexpected}. Refusing to select "
             "the WiiM output"
         )
+
+    for ip, name in config.followers:
+        status = wiim_request(ip, "getStatusEx")
+        if str(status.get("group")) != "1":
+            raise BridgeError(
+                f"{name} ({ip}) is not joined to a group; refusing to select the "
+                "WiiM output"
+            )
+        if status.get("master_ip") != config.kitchen_ip:
+            raise BridgeError(
+                f"{name} ({ip}) follows {status.get('master_ip')!r} rather than "
+                f"{config.kitchen_device_name} ({config.kitchen_ip}); refusing to "
+                "select the WiiM output"
+            )
 
 
 def find_output(
@@ -116,8 +174,13 @@ def find_output(
             f"found {len(matches)}"
         )
     output = matches[0]
+    # Reject a malformed entry now rather than part-way through a change.
     output_id(output)
     return output
+
+
+def resolve_target(items: list[dict[str, object]], target: str) -> dict[str, object]:
+    return find_output(items, *target_output(target))
 
 
 def output_id(output: dict[str, object]) -> str:
@@ -143,15 +206,17 @@ def set_outputs(selected: list[dict[str, object]]) -> None:
 
 
 def set_output_volume(output: dict[str, object], volume: int) -> None:
-    if not 0 <= volume <= 100:
-        raise BridgeError("volume must be between 0 and 100")
+    low, high = VOLUME_RANGE
+    if not low <= volume <= high:
+        raise BridgeError(f"volume must be between {low} and {high}")
     query = urllib.parse.urlencode({"volume": volume, "output_id": output_id(output)})
     request(f"/player/volume?{query}", method="PUT")
 
 
 def set_output_offset(output: dict[str, object], offset_ms: int) -> None:
-    if not -2000 <= offset_ms <= 2000:
-        raise BridgeError("offset must be between -2000 and 2000 milliseconds")
+    low, high = OFFSET_RANGE_MS
+    if not low <= offset_ms <= high:
+        raise BridgeError(f"offset must be between {low} and {high} milliseconds")
     request(
         f"/outputs/{output_id(output)}",
         method="PUT",
@@ -175,9 +240,9 @@ def show_status() -> None:
 
 def select_local() -> None:
     items = outputs()
-    local = find_output(items, LOCAL_NAME, "AirPlay 1")
+    local = resolve_target(items, "local")
     set_outputs([local])
-    print(f"Selected only {LOCAL_NAME}.")
+    print(f"Selected only {get_config().local_output_name}.")
 
 
 def select_all(confirmed: bool) -> None:
@@ -187,11 +252,12 @@ def select_all(confirmed: bool) -> None:
             "--confirm-wiim-takeover after a brief interruption is acceptable."
         )
     validate_wiim_group()
+    config = get_config()
     items = outputs()
-    local = find_output(items, LOCAL_NAME, "AirPlay 1")
-    wiim = find_output(items, WIIM_NAME, "AirPlay 2")
+    local = resolve_target(items, "local")
+    wiim = resolve_target(items, "wiim")
     set_outputs([local, wiim])
-    print(f"Selected {LOCAL_NAME} and {WIIM_NAME}.")
+    print(f"Selected {config.local_output_name} and {config.wiim_output_name}.")
 
 
 def stop() -> None:
@@ -201,48 +267,48 @@ def stop() -> None:
 
 def set_offset(target: str, offset_ms: int) -> None:
     items = outputs()
-    name = LOCAL_NAME if target == "local" else WIIM_NAME
-    output_type = "AirPlay 1" if target == "local" else "AirPlay 2"
-    output = find_output(items, name, output_type)
+    output = resolve_target(items, target)
     set_output_offset(output, offset_ms)
-    print(f"Set {name} offset to {offset_ms} ms.")
+    print(f"Set {output.get('name')} offset to {offset_ms} ms.")
 
 
 def set_volume(target: str, volume: int) -> None:
     items = outputs()
-    name = LOCAL_NAME if target == "local" else WIIM_NAME
-    output_type = "AirPlay 1" if target == "local" else "AirPlay 2"
-    output = find_output(items, name, output_type)
+    output = resolve_target(items, target)
     set_output_volume(output, volume)
-    print(f"Set {name} volume to {volume}%.")
+    print(f"Set {output.get('name')} volume to {volume}%.")
 
 
 def reconcile_once() -> None:
     """Restore the tested topology, selections, levels, and sync offsets."""
     validate_wiim_group()
+    config = get_config()
     items = outputs()
-    local = find_output(items, LOCAL_NAME, "AirPlay 1")
-    wiim = find_output(items, WIIM_NAME, "AirPlay 2")
+    local = resolve_target(items, "local")
+    wiim = resolve_target(items, "wiim")
 
-    # Apply levels before connecting so stale cached values cannot produce an
-    # unexpectedly loud burst when the outputs become active.
-    set_output_volume(local, CONFIG.local_volume)
-    set_output_volume(wiim, CONFIG.wiim_volume)
-    set_output_offset(local, CONFIG.local_offset_ms)
-    set_output_offset(wiim, CONFIG.wiim_offset_ms)
+    # Deselect first so the outputs are certainly idle, then apply levels before
+    # reconnecting. Without the deselect, OwnTone may already have restored its
+    # cached selection at a cached volume, and the burst this is meant to
+    # prevent has already happened.
+    set_outputs([])
+    set_output_volume(local, config.local_volume)
+    set_output_volume(wiim, config.wiim_volume)
+    set_output_offset(local, config.local_offset_ms)
+    set_output_offset(wiim, config.wiim_offset_ms)
     set_outputs([local, wiim])
 
     refreshed = outputs()
-    refreshed_local = find_output(refreshed, LOCAL_NAME, "AirPlay 1")
-    refreshed_wiim = find_output(refreshed, WIIM_NAME, "AirPlay 2")
+    refreshed_local = resolve_target(refreshed, "local")
+    refreshed_wiim = resolve_target(refreshed, "wiim")
     expected_ids = {output_id(local), output_id(wiim)}
     selected_ids = {output_id(item) for item in refreshed if bool(item.get("selected"))}
     checks = (
         selected_ids == expected_ids,
-        output_integer(refreshed_local, "volume") == CONFIG.local_volume,
-        output_integer(refreshed_wiim, "volume") == CONFIG.wiim_volume,
-        output_integer(refreshed_local, "offset_ms") == CONFIG.local_offset_ms,
-        output_integer(refreshed_wiim, "offset_ms") == CONFIG.wiim_offset_ms,
+        output_integer(refreshed_local, "volume") == config.local_volume,
+        output_integer(refreshed_wiim, "volume") == config.wiim_volume,
+        output_integer(refreshed_local, "offset_ms") == config.local_offset_ms,
+        output_integer(refreshed_wiim, "offset_ms") == config.wiim_offset_ms,
     )
     if not all(checks):
         raise BridgeError("OwnTone did not retain the reconciled output state")
@@ -251,14 +317,15 @@ def reconcile_once() -> None:
 def reconcile(wait_seconds: int) -> None:
     if wait_seconds < 0 or wait_seconds > 600:
         raise BridgeError("wait-seconds must be between 0 and 600")
+    config = get_config()
     deadline = time.monotonic() + wait_seconds
     while True:
         try:
             reconcile_once()
             print(
-                f"Reconciled {CONFIG.kitchen_device_name} leader -> "
-                f"{CONFIG.living_room_device_name} follower; selected "
-                f"PC at {CONFIG.local_volume}% and WiiM at {CONFIG.wiim_volume}%."
+                f"Reconciled {config.kitchen_device_name} leader -> "
+                f"{describe(set(config.followers))}; selected PC at "
+                f"{config.local_volume}% and WiiM at {config.wiim_volume}%."
             )
             return
         except (BridgeError, OSError, ValueError) as exc:
@@ -271,9 +338,10 @@ def reconcile(wait_seconds: int) -> None:
 
 def show_group_status() -> None:
     validate_wiim_group()
+    config = get_config()
     print(
-        f"WiiM group is healthy: {CONFIG.kitchen_device_name} leader -> "
-        f"{CONFIG.living_room_device_name} follower."
+        f"WiiM group is healthy: {config.kitchen_device_name} leader -> "
+        f"{describe(set(config.followers))}."
     )
 
 
@@ -308,25 +376,29 @@ def parser() -> argparse.ArgumentParser:
     return cli
 
 
+COMMANDS = {
+    "status": lambda args: show_status(),
+    "group-status": lambda args: show_group_status(),
+    "select-local": lambda args: select_local(),
+    "select-all": lambda args: select_all(args.confirm_wiim_takeover),
+    "stop": lambda args: stop(),
+    "set-volume": lambda args: set_volume(args.target, args.percent),
+    "set-offset": lambda args: set_offset(args.target, args.milliseconds),
+    "reconcile": lambda args: reconcile(args.wait_seconds),
+}
+
+
 def main() -> int:
     args = parser().parse_args()
+    handler = COMMANDS.get(args.command)
+    if handler is None:
+        print(f"error: unhandled command {args.command!r}", file=sys.stderr)
+        return 2
     try:
-        if args.command == "status":
-            show_status()
-        elif args.command == "group-status":
-            show_group_status()
-        elif args.command == "select-local":
-            select_local()
-        elif args.command == "select-all":
-            select_all(args.confirm_wiim_takeover)
-        elif args.command == "stop":
-            stop()
-        elif args.command == "set-volume":
-            set_volume(args.target, args.percent)
-        elif args.command == "set-offset":
-            set_offset(args.target, args.milliseconds)
-        elif args.command == "reconcile":
-            reconcile(args.wait_seconds)
+        handler(args)
+    except ConfigError as exc:
+        print(f"error: invalid configuration: {exc}", file=sys.stderr)
+        return 2
     except BridgeError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
