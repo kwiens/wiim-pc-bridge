@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import bridge
@@ -270,6 +271,22 @@ class SinkMatchingTests(unittest.TestCase):
 
     def test_a_block_without_a_sink_field_returns_none(self) -> None:
         self.assertIsNone(doctor.block_sink_id("Sink Input #7\n\tMute: no"))
+
+
+class PublishedPathTests(unittest.TestCase):
+    def test_a_path_outside_the_repository_is_never_published(self) -> None:
+        # The key lives in ~/.config by design, and `git check-ignore` calls
+        # anything outside the working tree "not ignored" — which must not be
+        # read as "a clone would carry it".
+        outside = Path.home() / ".config/wiim-pc-bridge/soloist_api_key"
+        self.assertFalse(doctor.is_published(outside))
+        self.assertFalse(doctor.is_published(Path("/etc/hostname")))
+
+    def test_an_unignored_path_inside_the_repository_is_published(self) -> None:
+        self.assertTrue(doctor.is_published(doctor.PROJECT / "README.md"))
+
+    def test_an_ignored_path_inside_the_repository_is_not_published(self) -> None:
+        self.assertFalse(doctor.is_published(doctor.PROJECT / "cache/owntone"))
 
 
 class IgnoreFileTests(unittest.TestCase):

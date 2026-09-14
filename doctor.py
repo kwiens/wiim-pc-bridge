@@ -9,6 +9,7 @@ import re
 import shutil
 import stat
 import subprocess  # nosec B404
+from pathlib import Path
 
 import bridge
 from bridge_config import PROJECT, ConfigError, get_config
@@ -102,8 +103,16 @@ def is_tracked(path: object) -> bool:
 
 
 def is_published(path: object) -> bool:
-    """True when a clone of this repository would carry the file."""
-    return is_tracked(path) or not is_ignored(path)
+    """True when a clone of this repository would carry the file.
+
+    A path outside the working tree cannot be published by this repository at
+    all, and `git check-ignore` reports it as "not ignored", so it has to be
+    excluded before that answer is consulted.
+    """
+    resolved = Path(path).resolve()
+    if resolved != PROJECT and PROJECT not in resolved.parents:
+        return False
+    return is_tracked(resolved) or not is_ignored(resolved)
 
 
 def owntone_outputs() -> list[dict[str, object]]:
