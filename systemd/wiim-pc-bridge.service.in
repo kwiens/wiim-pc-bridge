@@ -9,9 +9,14 @@ StartLimitBurst=5
 Type=exec
 WorkingDirectory=@PROJECT_DIRECTORY@
 ExecStartPre=@PROJECT_DIRECTORY@/ensure-runtime.sh
+# Containers with a Docker restart policy may come up before PipeWire and this
+# user service after a reboot. Always replace that unordered boot state with a
+# clean, dependency-ordered Compose start before selecting any outputs.
+ExecStartPre=/usr/bin/docker compose --env-file @PROJECT_DIRECTORY@/.env stop --timeout 20
 ExecStartPre=/usr/bin/docker compose --env-file @PROJECT_DIRECTORY@/.env up -d --wait --wait-timeout 180 --remove-orphans
 ExecStartPre=@PROJECT_DIRECTORY@/bridge.py reconcile --wait-seconds 180
 ExecStart=/usr/bin/python3 @PROJECT_DIRECTORY@/volume_handoff.py
+ExecStartPost=/usr/bin/python3 @PROJECT_DIRECTORY@/audio_flow_check.py --wait-seconds 20
 ExecStop=-/usr/bin/docker compose --env-file @PROJECT_DIRECTORY@/.env stop
 Restart=on-failure
 RestartSec=10s

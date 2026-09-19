@@ -15,6 +15,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
+import audio_flow_check
 from bridge_config import PROJECT
 
 # All subprocess calls use fixed local argv and never invoke a shell.
@@ -30,9 +31,16 @@ DEFAULT_VOLUME = 40
 SAMPLE_INTERVAL = 0.25
 SETTLE_SECONDS = 0.6
 RECONNECT_SECONDS = 2.0
+FLOW_CHECK_INTERVAL = 30.0
+FLOW_CHECK_SECONDS = 5
+FLOW_FAILURE_LIMIT = 2
 
 stop_requested = False
 trace_process: subprocess.Popen[str] | None = None
+
+
+class PipelineStalled(RuntimeError):
+    """Active source PCM repeatedly failed to reach the local output."""
 
 
 def parse_mpris_volume(output: str) -> int:
@@ -94,6 +102,17 @@ class VolumeTracker:
         self.saved_volume = volume
         self.pending_volume = None
         return volume
+
+
+@dataclass
+class FlowFailureTracker:
+    """Require repeat evidence before restarting an otherwise healthy stack."""
+
+    consecutive: int = 0
+
+    def observe(self, failed: bool) -> bool:
+        self.consecutive = self.consecutive + 1 if failed else 0
+        return self.consecutive >= FLOW_FAILURE_LIMIT
 
 
 def load_saved_volume(path: Path = VOLUME_FILE) -> int | None:
@@ -215,6 +234,8 @@ def monitor_trace(tracker: VolumeTracker) -> None:
     selector = selectors.DefaultSelector()
     selector.register(trace_process.stdout, selectors.EVENT_READ)
     next_sample = time.monotonic() + SAMPLE_INTERVAL
+    next_flow_check = time.monotonic() + FLOW_CHECK_INTERVAL
+    flow_failures = FlowFailureTracker()
     mpris_missing_reported = False
     try:
         while not stop_requested:
@@ -241,6 +262,37 @@ def monitor_trace(tracker: VolumeTracker) -> None:
                         )
 
             now = time.monotonic()
+            if tracker.active is True and now >= next_flow_check:
+                next_flow_check = now + FLOW_CHECK_INTERVAL
+                try:
+                    failed = bool(
+                        audio_flow_check.check_flow(FLOW_CHECK_SECONDS, verbose=False)
+                    )
+                except (
+                    OSError,
+                    RuntimeError,
+                    ValueError,
+                    json.JSONDecodeError,
+                    subprocess.SubprocessError,
+                ) as exc:
+                    flow_failures.observe(False)
+                    print(
+                        f"Live audio flow probe unavailable: {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                else:
+                    if failed:
+                        print(
+                            "Live audio flow probe found active source PCM but "
+                            "a silent PC output.",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    if flow_failures.observe(failed):
+                        raise PipelineStalled(
+                            "live PCM repeatedly failed to reach the PC output"
+                        )
             if now < next_sample:
                 continue
             next_sample = now + SAMPLE_INTERVAL
@@ -286,6 +338,9 @@ def main() -> int:
     while not stop_requested:
         try:
             monitor_trace(tracker)
+        except PipelineStalled as exc:
+            print(f"Audio pipeline stalled: {exc}", file=sys.stderr, flush=True)
+            return 1
         except (OSError, RuntimeError) as exc:
             if not stop_requested:
                 print(f"Soloist trace unavailable: {exc}", file=sys.stderr, flush=True)

@@ -32,6 +32,10 @@ KNOWN_KEYS = frozenset(
         "DISPLAYPORT_SINK",
         "KITCHEN_DEVICE_NAME",
         "KITCHEN_IP",
+        "KEEPALIVE_ENABLED",
+        "KEEPALIVE_INTERVAL_SECONDS",
+        "KEEPALIVE_DURATION_SECONDS",
+        "KEEPALIVE_LEVEL_DB",
         "LIVING_ROOM_DEVICE_NAME",
         "LIVING_ROOM_IP",
         "LOCAL_OFFSET_MS",
@@ -167,6 +171,10 @@ class BridgeConfig:
     local_offset_ms: int
     wiim_offset_ms: int
     start_buffer_ms: int
+    keepalive_enabled: bool
+    keepalive_interval_seconds: int
+    keepalive_duration_seconds: int
+    keepalive_level_db: int
 
     @property
     def trusted_network_prefix(self) -> str:
@@ -246,6 +254,8 @@ def load_config() -> BridgeConfig:
     uid = _integer(values, "BRIDGE_UID", os.getuid())
     living_room_ip = _value(values, "LIVING_ROOM_IP", "192.0.2.11")
     living_room_device_name = _value(values, "LIVING_ROOM_DEVICE_NAME", "Living Room")
+    keepalive_enabled = _integer(values, "KEEPALIVE_ENABLED", 0)
+    _bounded("KEEPALIVE_ENABLED", keepalive_enabled, (0, 1))
     config = BridgeConfig(
         uid=uid,
         gid=_integer(values, "BRIDGE_GID", os.getgid()),
@@ -286,12 +296,21 @@ def load_config() -> BridgeConfig:
         local_offset_ms=_integer(values, "LOCAL_OFFSET_MS", 0),
         wiim_offset_ms=_integer(values, "WIIM_OFFSET_MS", 0),
         start_buffer_ms=_integer(values, "START_BUFFER_MS", 2250),
+        keepalive_enabled=bool(keepalive_enabled),
+        keepalive_interval_seconds=_integer(values, "KEEPALIVE_INTERVAL_SECONDS", 600),
+        keepalive_duration_seconds=_integer(values, "KEEPALIVE_DURATION_SECONDS", 3),
+        keepalive_level_db=_integer(values, "KEEPALIVE_LEVEL_DB", -42),
     )
     _bounded("LOCAL_VOLUME", config.local_volume, VOLUME_RANGE)
     _bounded("WIIM_VOLUME", config.wiim_volume, VOLUME_RANGE)
     _bounded("LOCAL_OFFSET_MS", config.local_offset_ms, OFFSET_RANGE_MS)
     _bounded("WIIM_OFFSET_MS", config.wiim_offset_ms, OFFSET_RANGE_MS)
     _bounded("START_BUFFER_MS", config.start_buffer_ms, START_BUFFER_RANGE_MS)
+    _bounded(
+        "KEEPALIVE_INTERVAL_SECONDS", config.keepalive_interval_seconds, (60, 1800)
+    )
+    _bounded("KEEPALIVE_DURATION_SECONDS", config.keepalive_duration_seconds, (1, 10))
+    _bounded("KEEPALIVE_LEVEL_DB", config.keepalive_level_db, (-60, -20))
     if config.uid < 0 or config.gid < 0:
         raise ConfigError("BRIDGE_UID and BRIDGE_GID must be non-negative")
     for name, path in (

@@ -1,10 +1,21 @@
 #!/bin/sh
 set -eu
 
+service_name=wiim-pc-bridge.service
+if [ "$#" -gt 1 ]; then
+  echo "Usage: $0 [--keepalive]" >&2
+  exit 2
+fi
+case "$*" in
+  '') ;;
+  --keepalive) service_name=wiim-pc-bridge-keepalive.service ;;
+  *) echo "Usage: $0 [--keepalive]" >&2; exit 2 ;;
+esac
+
 project_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
-template="$project_directory/systemd/wiim-pc-bridge.service.in"
+template="$project_directory/systemd/$service_name.in"
 unit_directory=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
-unit_file="$unit_directory/wiim-pc-bridge.service"
+unit_file="$unit_directory/$service_name"
 temporary_file=""
 backup_file=""
 unit_replaced=0
@@ -22,18 +33,18 @@ cleanup() {
     fi
     systemctl --user daemon-reload || true
     if [ "$previous_enabled" -eq 1 ]; then
-      systemctl --user enable wiim-pc-bridge.service || true
+      systemctl --user enable "$service_name" || true
     else
-      systemctl --user disable wiim-pc-bridge.service || true
+      systemctl --user disable "$service_name" || true
     fi
     # Only disturb the running service if this script actually restarted it.
     # A failure earlier than that left a healthy bridge running, and stopping
     # or restarting it here would be strictly worse than doing nothing.
     if [ "$service_touched" -eq 1 ]; then
       if [ "$previous_active" -eq 1 ]; then
-        systemctl --user restart wiim-pc-bridge.service || true
+        systemctl --user restart "$service_name" || true
       else
-        systemctl --user stop wiim-pc-bridge.service || true
+        systemctl --user stop "$service_name" || true
       fi
     fi
   fi
@@ -61,10 +72,10 @@ case "$project_directory" in
 esac
 
 mkdir -p "$unit_directory"
-if systemctl --user is-enabled --quiet wiim-pc-bridge.service 2>/dev/null; then
+if systemctl --user is-enabled --quiet "$service_name" 2>/dev/null; then
   previous_enabled=1
 fi
-if systemctl --user is-active --quiet wiim-pc-bridge.service 2>/dev/null; then
+if systemctl --user is-active --quiet "$service_name" 2>/dev/null; then
   previous_active=1
 fi
 temporary_file=$(mktemp "$unit_directory/wiim-pc-bridge.XXXXXX.service")
@@ -84,9 +95,9 @@ temporary_file=""
 unit_replaced=1
 
 systemctl --user daemon-reload
-systemctl --user enable wiim-pc-bridge.service
+systemctl --user enable "$service_name"
 service_touched=1
-systemctl --user restart wiim-pc-bridge.service
+systemctl --user restart "$service_name"
 unit_replaced=0
 service_touched=0
 echo "Installed and started $unit_file"

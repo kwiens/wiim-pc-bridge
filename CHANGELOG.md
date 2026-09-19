@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+### Fixed
+
+- Wait up to 60 seconds for WirePlumber to enumerate the configured DisplayPort
+  sink during boot instead of permanently failing when PipeWire's socket becomes
+  ready first.
+- Cold-start the Compose stack on every bridge-service start. Docker can restore
+  `unless-stopped` containers before PipeWire and the user service, leaving
+  OwnTone and the PCM FIFO individually healthy but connected in a stale order.
+  The service now replaces that unordered state before reconciling outputs.
+- Verify active PCM end to end after service startup. When Spotify is producing
+  audio but the physical PC sink remains digitally silent after both source and
+  output grace periods, startup now fails and uses the clean recovery path.
+- Repeat that flow check during active playback and automatically cold-recover
+  after two consecutive confirmed stalls, while treating genuine source silence
+  and a temporarily unavailable diagnostic as non-failures.
+
+### Added
+
+- Opt-in idle speaker keepalive: a level-configurable, cosine-faded three-second
+  tone after ten minutes without audio, mixed independently of Spotify volume.
+  A separate user service avoids restarting the bridge containers. Safety checks
+  skip disconnected outputs, other active sources, and uncertain device state;
+  the helper never reconnects AirPlay or changes playback volumes.
+
 ### Security
 
 - Scan the whole Git history for credentials, not just the working tree. A key

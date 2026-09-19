@@ -39,12 +39,15 @@ jobs:
           test ! -f .env
           python bridge.py --help > /dev/null
           python render-config.py --help > /dev/null
+          python idle_keepalive.py --help > /dev/null
+          python audio_flow_check.py --help > /dev/null
       - name: Python tests
         run: python -m unittest discover -s tests -v
       - name: Python syntax
         run: >-
           python -m compileall -q bridge.py bridge_config.py doctor.py
-          render-config.py volume_handoff.py tests
+          render-config.py volume_handoff.py idle_keepalive.py
+          audio_flow_check.py tests
       - name: Python lint and formatting
         run: |
           ruff check .
@@ -52,7 +55,8 @@ jobs:
       - name: Python security scan
         run: >-
           bandit -q -r bridge.py bridge_config.py doctor.py render-config.py
-          volume_handoff.py scripts/check-secrets.py
+          volume_handoff.py idle_keepalive.py audio_flow_check.py
+          scripts/check-secrets.py
       - name: YAML lint
         run: yamllint .github compose.yaml
       - name: Compose validation

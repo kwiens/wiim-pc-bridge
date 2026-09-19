@@ -1,0 +1,18 @@
+[Unit]
+Description=Optional idle audio keepalive for WiiM-connected powered speakers
+Requires=wiim-pc-bridge.service
+After=wiim-pc-bridge.service
+PartOf=wiim-pc-bridge.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=exec
+WorkingDirectory=@PROJECT_DIRECTORY@
+ExecStart=/usr/bin/python3 @PROJECT_DIRECTORY@/idle_keepalive.py
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=15s
+
+[Install]
+WantedBy=wiim-pc-bridge.service

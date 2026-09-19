@@ -52,6 +52,18 @@ class VolumeHandoffTests(unittest.TestCase):
             self.assertEqual(volume_handoff.load_saved_volume(path), 57)
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
+    def test_flow_failures_require_two_consecutive_observations(self) -> None:
+        tracker = volume_handoff.FlowFailureTracker()
+        self.assertFalse(tracker.observe(True))
+        self.assertFalse(tracker.observe(False))
+        self.assertFalse(tracker.observe(True))
+        self.assertTrue(tracker.observe(True))
+
+    def test_success_resets_accumulated_flow_failures(self) -> None:
+        tracker = volume_handoff.FlowFailureTracker(consecutive=1)
+        self.assertFalse(tracker.observe(False))
+        self.assertEqual(tracker.consecutive, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -88,6 +88,7 @@ Prepare and start the bridge:
 
 ```bash
 ./ensure-runtime.sh
+docker compose stop --timeout 20
 docker compose up -d --build --wait --wait-timeout 180
 ./bridge.py reconcile --wait-seconds 180
 ./doctor.py
@@ -190,13 +191,76 @@ the key cannot be committed by a stray `git add -A`.
   exiting restarts the container.
 - Shairport uses classic AirPlay to avoid competing with OwnTone for AirPlay 2
   PTP services. Its Pulse backend shares the selected PC sink with desktop audio.
-- All containers use `unless-stopped`; systemd waits for PipeWire and Docker.
+- All containers use `unless-stopped`; systemd waits for PipeWire, Docker, and
+  the configured physical output. Because Docker may independently restore
+  those containers earlier in boot, every service start first stops that
+  unordered state and then cold-starts the Compose dependency graph. OwnTone
+  and the FIFO writer therefore rendezvous before outputs are selected.
 - Startup reconciliation restores output selection, volume and offsets rather
   than relying only on OwnTone's cache database.
+- When Spotify is already active during startup, a post-start probe samples the
+  private sink and physical PC output concurrently. Active source PCM followed
+  by persistent digital silence fails the unit, invoking the clean restart path
+  instead of accepting a superficially healthy pipeline.
+- The volume handoff monitor repeats the same live-signal check during active
+  playback. Two consecutive stalled-flow results fail the service and trigger a
+  complete cold recovery; silence, buffering, or an unavailable probe does not.
 - The host-side handoff monitor preserves Spotify's source volume when Soloist
   becomes active and stores only the numeric level for the next restart.
 - `doctor.py` audits secrets, containers, startup, audio routing, output state,
   WiiM topology, and Soloist expiry without changing the system.
+
+## Optional idle speaker keepalive
+
+Some powered speakers enter standby when their analog input has no signal.
+An open AirPlay session carrying digital silence does not necessarily prevent
+that. The optional keepalive mixes a short non-silent tone into the private
+bridge sink, independently of Spotify's volume. It is an experimental workaround,
+not a confirmed fix for periodic speaker chimes or a command to power speakers on.
+
+Set these values in the private `.env` to enable a trial:
+
+```dotenv
+KEEPALIVE_ENABLED=1
+KEEPALIVE_INTERVAL_SECONDS=600
+KEEPALIVE_DURATION_SECONDS=3
+KEEPALIVE_LEVEL_DB=-42
+```
+
+The level is the tone's peak in dBFS before existing bridge output gains. It is
+not guaranteed to be inaudible or sufficient to reset a particular speaker's
+signal detector. The 500 Hz tone has 200 ms fades to avoid sharp clicks; both
+selected bridge outputs, including the PC, receive it. No Spotify, WiiM, sink,
+or OwnTone volume is changed.
+
+Install the separate user service without restarting the bridge containers:
+
+```bash
+./install-service.sh --keepalive
+journalctl --user -u wiim-pc-bridge-keepalive.service -f
+```
+
+Its first automatic burst is due after ten minutes without detected bridge
+audio. Later bursts wait the same interval after audio or the previous burst.
+Spotify/Soloist playback (including muted or headless playback), another WiiM source,
+invalid topology, failed safety checks, or a disconnected WiiM output suppress
+the burst. The helper never automatically reconnects an output or takes another
+source over. Restore a failed output explicitly with the existing bridge controls
+only when an interruption is acceptable.
+
+For a guarded one-off calibration burst, stop the keepalive service if installed
+and run `python3 idle_keepalive.py --once`. It waits for five seconds of quiet and
+refuses to send if its safety checks fail. Restart the service afterward to resume
+the interval trial. After changing `.env`, restart only the keepalive service.
+
+Disable and stop the trial immediately with:
+
+```bash
+systemctl --user disable --now wiim-pc-bridge-keepalive.service
+```
+
+Also set `KEEPALIVE_ENABLED=0` if it should remain off when reinstalled. Disabling
+this helper leaves the ordinary bridge and Spotify volume handoff running.
 
 ## Updates
 
@@ -226,6 +290,7 @@ the Python tests, syntax, Compose model, shell scripts, and credential scan.
 2. Restore `.env` from a secure backup or recreate it from `.env.example`.
 3. Generate a fresh Soloist key and run `./save-soloist-key.sh`.
 4. Run `./ensure-runtime.sh` and
+   `docker compose stop --timeout 20`, followed by
    `docker compose up -d --build --wait --wait-timeout 180`.
 5. Run `./install-service.sh`, enable user lingering, and reboot once.
 6. Select the bridge in Spotify and run `./doctor.py`.
@@ -241,6 +306,7 @@ docker compose ps
 docker compose logs --tail 150 owntone shairport soloist
 systemctl --user status wiim-pc-bridge.service
 journalctl --user -u wiim-pc-bridge.service
+./audio_flow_check.py
 python3 -m unittest discover -s tests -v
 docker compose --env-file .env.example config --quiet
 ./scripts/check-secrets.py

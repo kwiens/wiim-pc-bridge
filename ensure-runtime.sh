@@ -86,9 +86,18 @@ until [ -S "$BRIDGE_RUNTIME_DIR/pipewire-0" ] \
   sleep 1
 done
 
-if ! pactl list short sinks | awk '{print $2}' | grep -Fxq "$DISPLAYPORT_SINK"; then
-  echo "Configured DisplayPort sink is unavailable: $DISPLAYPORT_SINK" >&2
-  exit 1
-fi
+# PipeWire's control socket can be ready before WirePlumber has enumerated the
+# physical display device. This is common during login after a reboot, so wait
+# for the configured sink instead of turning that normal race into a permanent
+# failed service.
+attempt=0
+until pactl list short sinks | awk '{print $2}' | grep -Fxq "$DISPLAYPORT_SINK"; do
+  attempt=$((attempt + 1))
+  if [ "$attempt" -ge 60 ]; then
+    echo "Configured DisplayPort sink was unavailable after 60 seconds: $DISPLAYPORT_SINK" >&2
+    exit 1
+  fi
+  sleep 1
+done
 
 echo "Runtime prerequisites are ready."
