@@ -1,0 +1,15 @@
+[Unit]
+Description=Spotify volume handoff helper (independent of audio recovery)
+Requires=wiim-pc-bridge.service
+After=wiim-pc-bridge.service
+PartOf=wiim-pc-bridge.service
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=exec
+WorkingDirectory=@PROJECT_DIRECTORY@
+ExecStart=/usr/bin/python3 @PROJECT_DIRECTORY@/volume_handoff.py
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=15s

@@ -71,6 +71,12 @@ class TemplateTests(unittest.TestCase):
         self.assertIn("port = 0", mpd_block)
         self.assertNotIn("6600", mpd_block)
 
+    def test_shairport_is_limited_to_the_configured_interface(self) -> None:
+        template = (PROJECT / "shairport-sync.conf.in").read_text(encoding="utf-8")
+        with configured(SHAIRPORT_INTERFACE="enp4s0"):
+            rendered = render_config.render(template, render_config.replacements())
+        self.assertIn('interface = "enp4s0";', rendered)
+
 
 class ExportTests(unittest.TestCase):
     def test_values_are_shell_quoted_for_the_helper_scripts(self) -> None:
@@ -81,6 +87,7 @@ class ExportTests(unittest.TestCase):
         lines = dict(line.split("=", 1) for line in buffer.getvalue().splitlines())
         self.assertEqual(lines["BRIDGE_UID"], "1000")
         self.assertEqual(lines["DISPLAYPORT_SINK"], "alsa_output.test-card")
+        self.assertEqual(lines["SHAIRPORT_INTERFACE"], "eth0")
 
     def test_a_value_with_a_space_survives_shell_evaluation(self) -> None:
         with configured(BRIDGE_RUNTIME_DIR="/run/user/1000"):

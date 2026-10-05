@@ -13,6 +13,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+import output_control
 from bridge_config import (
     OFFSET_RANGE_MS,
     VOLUME_RANGE,
@@ -79,7 +80,10 @@ def outputs() -> list[dict[str, object]]:
     response = request("/outputs")
     if not isinstance(response, dict) or not isinstance(response.get("outputs"), list):
         raise BridgeError("OwnTone returned an unexpected outputs response")
-    return response["outputs"]
+    items = response["outputs"]
+    if not all(isinstance(item, dict) for item in items):
+        raise BridgeError("OwnTone returned a malformed output entry")
+    return items
 
 
 def wiim_request(ip: str, command: str) -> dict[str, object]:
@@ -183,17 +187,34 @@ def resolve_target(items: list[dict[str, object]], target: str) -> dict[str, obj
     return find_output(items, *target_output(target))
 
 
+def resolve_pair(
+    items: list[dict[str, object]],
+) -> tuple[dict[str, object], dict[str, object]]:
+    local = resolve_target(items, "local")
+    wiim = resolve_target(items, "wiim")
+    if output_id(local) == output_id(wiim):
+        raise BridgeError("configured PC and WiiM outputs share the same id")
+    return local, wiim
+
+
 def output_id(output: dict[str, object]) -> str:
     value = output.get("id")
-    if value is None or not str(value):
+    if isinstance(value, bool) or not isinstance(value, int | str) or not str(value):
         raise BridgeError("OwnTone output is missing its id")
     return str(value)
 
 
 def output_integer(output: dict[str, object], field: str) -> int:
     try:
-        return int(output[field])
-    except (KeyError, TypeError, ValueError) as exc:
+        value = output[field]
+        if isinstance(value, bool):
+            raise ValueError
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.lstrip("-").isdigit():
+            return int(value)
+        raise ValueError
+    except (KeyError, ValueError) as exc:
         raise BridgeError(f"OwnTone output has an invalid {field}") from exc
 
 
@@ -217,11 +238,8 @@ def set_output_offset(output: dict[str, object], offset_ms: int) -> None:
     low, high = OFFSET_RANGE_MS
     if not low <= offset_ms <= high:
         raise BridgeError(f"offset must be between {low} and {high} milliseconds")
-    request(
-        f"/outputs/{output_id(output)}",
-        method="PUT",
-        payload={"offset_ms": offset_ms},
-    )
+    identifier = urllib.parse.quote(output_id(output), safe="")
+    request(f"/outputs/{identifier}", method="PUT", payload={"offset_ms": offset_ms})
 
 
 def show_status() -> None:
@@ -239,9 +257,11 @@ def show_status() -> None:
 
 
 def select_local() -> None:
-    items = outputs()
-    local = resolve_target(items, "local")
-    set_outputs([local])
+    with output_control.locked():
+        items = outputs()
+        local = resolve_target(items, "local")
+        output_control.set_mode("local")
+        set_outputs([local])
     print(f"Selected only {get_config().local_output_name}.")
 
 
@@ -251,17 +271,20 @@ def select_all(confirmed: bool) -> None:
             "Selecting the WiiM leader replaces its active source. Re-run with "
             "--confirm-wiim-takeover after a brief interruption is acceptable."
         )
-    validate_wiim_group()
-    config = get_config()
-    items = outputs()
-    local = resolve_target(items, "local")
-    wiim = resolve_target(items, "wiim")
-    set_outputs([local, wiim])
+    with output_control.locked():
+        validate_wiim_group()
+        config = get_config()
+        items = outputs()
+        local, wiim = resolve_pair(items)
+        set_outputs([local, wiim])
+        output_control.set_automatic(True)
     print(f"Selected {config.local_output_name} and {config.wiim_output_name}.")
 
 
 def stop() -> None:
-    set_outputs([])
+    with output_control.locked():
+        output_control.set_mode("stopped")
+        set_outputs([])
     print("Deselected every OwnTone output; WiiM group membership was not changed.")
 
 
@@ -279,13 +302,12 @@ def set_volume(target: str, volume: int) -> None:
     print(f"Set {output.get('name')} volume to {volume}%.")
 
 
-def reconcile_once() -> None:
+def reconcile_once(*, activate: bool = True) -> None:
     """Restore the tested topology, selections, levels, and sync offsets."""
     validate_wiim_group()
     config = get_config()
     items = outputs()
-    local = resolve_target(items, "local")
-    wiim = resolve_target(items, "wiim")
+    local, wiim = resolve_pair(items)
 
     # Deselect first so the outputs are certainly idle, then apply levels before
     # reconnecting. Without the deselect, OwnTone may already have restored its
@@ -296,13 +318,15 @@ def reconcile_once() -> None:
     set_output_volume(wiim, config.wiim_volume)
     set_output_offset(local, config.local_offset_ms)
     set_output_offset(wiim, config.wiim_offset_ms)
-    set_outputs([local, wiim])
+    if activate:
+        set_outputs([local, wiim])
 
     refreshed = outputs()
-    refreshed_local = resolve_target(refreshed, "local")
-    refreshed_wiim = resolve_target(refreshed, "wiim")
-    expected_ids = {output_id(local), output_id(wiim)}
-    selected_ids = {output_id(item) for item in refreshed if bool(item.get("selected"))}
+    refreshed_local, refreshed_wiim = resolve_pair(refreshed)
+    expected_ids = {output_id(local), output_id(wiim)} if activate else set()
+    selected_ids = {
+        output_id(item) for item in refreshed if item.get("selected") is True
+    }
     checks = (
         selected_ids == expected_ids,
         output_integer(refreshed_local, "volume") == config.local_volume,
@@ -314,18 +338,32 @@ def reconcile_once() -> None:
         raise BridgeError("OwnTone did not retain the reconciled output state")
 
 
-def reconcile(wait_seconds: int) -> None:
+def reconcile(
+    wait_seconds: int, *, activate: bool = True, respect_manual: bool = False
+) -> None:
     if wait_seconds < 0 or wait_seconds > 600:
         raise BridgeError("wait-seconds must be between 0 and 600")
     config = get_config()
     deadline = time.monotonic() + wait_seconds
     while True:
         try:
-            reconcile_once()
+            with output_control.locked():
+                if respect_manual and not output_control.automatic_enabled():
+                    print(
+                        "Manual output control is active; leaving output selection unchanged."
+                    )
+                    return
+                reconcile_once(activate=activate)
+                output_control.set_automatic(True)
             print(
                 f"Reconciled {config.kitchen_device_name} leader -> "
-                f"{describe(set(config.followers))}; selected PC at "
-                f"{config.local_volume}% and WiiM at {config.wiim_volume}%."
+                f"{describe(set(config.followers))}; "
+                + (
+                    f"selected PC at {config.local_volume}% and WiiM at "
+                    f"{config.wiim_volume}%."
+                    if activate
+                    else "left AirPlay outputs disconnected while Spotify is idle."
+                )
             )
             return
         except (BridgeError, OSError, ValueError) as exc:
@@ -334,6 +372,80 @@ def reconcile(wait_seconds: int) -> None:
                     f"reconciliation did not become ready within {wait_seconds}s: {exc}"
                 ) from exc
             time.sleep(2)
+
+
+def resume_pcm_playback() -> bool:
+    """Resume our FIFO after an output failure paused OwnTone's player."""
+    player = request("/player")
+    if not isinstance(player, dict) or player.get("state") not in (
+        "play",
+        "pause",
+        "stop",
+    ):
+        raise BridgeError("OwnTone returned an unknown player state")
+    if player["state"] == "play":
+        return False
+    queue = request("/queue")
+    if not isinstance(queue, dict) or not isinstance(queue.get("items"), list):
+        raise BridgeError("OwnTone returned an unknown playback queue")
+    items = queue["items"]
+    current_id = player.get("item_id")
+    current = [
+        item
+        for item in items
+        if isinstance(item, dict)
+        and (
+            str(item.get("id")) == str(current_id)
+            or (current_id is None and len(items) == 1)
+        )
+    ]
+    if (
+        len(current) != 1
+        or current[0].get("data_kind") != "pipe"
+        or current[0].get("path") != "/srv/media/spotify.pcm"
+    ):
+        raise BridgeError(
+            "refusing to resume an OwnTone queue other than the bridge PCM pipe"
+        )
+    request("/player/play", method="PUT")
+    refreshed = request("/player")
+    if not isinstance(refreshed, dict) or refreshed.get("state") != "play":
+        raise BridgeError("OwnTone PCM player did not resume")
+    return True
+
+
+def pause_pcm_playback() -> bool:
+    """Stop a stale local session when Soloist is no longer the active source."""
+    player = request("/player")
+    if not isinstance(player, dict) or player.get("state") not in (
+        "play",
+        "pause",
+        "stop",
+    ):
+        raise BridgeError("OwnTone returned an unknown player state")
+    if player["state"] != "play":
+        return False
+    queue = request("/queue")
+    if not isinstance(queue, dict) or not isinstance(queue.get("items"), list):
+        raise BridgeError("OwnTone returned an unknown playback queue")
+    current = [
+        item
+        for item in queue["items"]
+        if isinstance(item, dict) and str(item.get("id")) == str(player.get("item_id"))
+    ]
+    if (
+        len(current) != 1
+        or current[0].get("data_kind") != "pipe"
+        or current[0].get("path") != "/srv/media/spotify.pcm"
+    ):
+        raise BridgeError(
+            "refusing to pause an OwnTone queue other than the bridge PCM pipe"
+        )
+    request("/player/pause", method="PUT")
+    refreshed = request("/player")
+    if not isinstance(refreshed, dict) or refreshed.get("state") != "pause":
+        raise BridgeError("OwnTone PCM player did not pause")
+    return True
 
 
 def show_group_status() -> None:
@@ -399,7 +511,7 @@ def main() -> int:
     except ConfigError as exc:
         print(f"error: invalid configuration: {exc}", file=sys.stderr)
         return 2
-    except BridgeError as exc:
+    except (BridgeError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     return 0

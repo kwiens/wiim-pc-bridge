@@ -80,10 +80,14 @@ class ActivityMonitor:
         self.thread.start()
 
     def _read(self) -> None:
-        assert self.process.stdout is not None
+        stream = self.process.stdout
+        if stream is None:
+            self.error = "PipeWire monitor output is unavailable"
+            self.ready.set()
+            return
         pending = b""
         try:
-            while data := self.process.stdout.read(BLOCK_BYTES):
+            while data := stream.read(BLOCK_BYTES):
                 pending += data
                 size = len(pending) - len(pending) % 2
                 if size:

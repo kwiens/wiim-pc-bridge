@@ -1,25 +1,20 @@
 [Unit]
 Description=PC and native WiiM group Spotify bridge
 Wants=pipewire.service pipewire-pulse.service
+Wants=wiim-pc-bridge-supervisor.service wiim-pc-bridge-volume.service
 After=pipewire.service pipewire-pulse.service
-StartLimitIntervalSec=300
-StartLimitBurst=5
+StartLimitIntervalSec=0
 
 [Service]
-Type=exec
-WorkingDirectory=@PROJECT_DIRECTORY@
-ExecStartPre=@PROJECT_DIRECTORY@/ensure-runtime.sh
-# Containers with a Docker restart policy may come up before PipeWire and this
-# user service after a reboot. Always replace that unordered boot state with a
-# clean, dependency-ordered Compose start before selecting any outputs.
-ExecStartPre=/usr/bin/docker compose --env-file @PROJECT_DIRECTORY@/.env stop --timeout 20
-ExecStartPre=/usr/bin/docker compose --env-file @PROJECT_DIRECTORY@/.env up -d --wait --wait-timeout 180 --remove-orphans
-ExecStartPre=@PROJECT_DIRECTORY@/bridge.py reconcile --wait-seconds 180
-ExecStart=/usr/bin/python3 @PROJECT_DIRECTORY@/volume_handoff.py
-ExecStartPost=/usr/bin/python3 @PROJECT_DIRECTORY@/audio_flow_check.py --wait-seconds 20
-ExecStop=-/usr/bin/docker compose --env-file @PROJECT_DIRECTORY@/.env stop
+Type=oneshot
+RemainAfterExit=yes
+# Retry failed startup prerequisites without stopping already-running containers.
 Restart=on-failure
-RestartSec=10s
+RestartSec=30s
+WorkingDirectory=@PROJECT_DIRECTORY@
+ExecStart=@PROJECT_DIRECTORY@/ensure-runtime.sh
+ExecStart=/usr/bin/docker compose --env-file @PROJECT_DIRECTORY@/.env up -d --wait --wait-timeout 180 --remove-orphans
+ExecStop=-/usr/bin/docker compose --env-file @PROJECT_DIRECTORY@/.env stop
 TimeoutStartSec=660
 TimeoutStopSec=60
 

@@ -49,14 +49,20 @@ if [ ! -p "$audio_fifo" ]; then
 fi
 chmod 0660 "$audio_fifo"
 
-if [ ! -s "$SOLOIST_KEY_FILE" ]; then
+if [ ! -f "$SOLOIST_KEY_FILE" ] || [ ! -s "$SOLOIST_KEY_FILE" ]; then
   echo "Soloist API key is missing; run ./save-soloist-key.sh first." >&2
   exit 1
 fi
 chmod 0600 "$SOLOIST_KEY_FILE"
 
-if [ ! -f "$PULSE_COOKIE_PATH" ]; then
-  echo "Pulse cookie is missing: $PULSE_COOKIE_PATH" >&2
+if [ ! -f "$PULSE_COOKIE_PATH" ] || [ ! -s "$PULSE_COOKIE_PATH" ]; then
+  echo "Pulse cookie is missing or empty: $PULSE_COOKIE_PATH" >&2
+  exit 1
+fi
+chmod 0600 "$PULSE_COOKIE_PATH"
+
+if ! ip link show dev "$SHAIRPORT_INTERFACE" >/dev/null 2>&1; then
+  echo "Configured Shairport interface does not exist: $SHAIRPORT_INTERFACE" >&2
   exit 1
 fi
 

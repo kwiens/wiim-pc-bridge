@@ -4,19 +4,59 @@
 
 ### Fixed
 
+- Detect the actual PipeWire source used by PCM capture, not just its stale
+  `target.object` request. An audio-device transition can move capture onto
+  the PC speaker monitor, creating a feedback path that the old doctor audit
+  called healthy. The supervisor now moves only the tagged bridge
+  capture back to its private monitor, including while Spotify is idle.
+- Check the local Shairport stream's actual sink while idle and restore only
+  that stream if an audio-device transition moved it off the configured PC
+  sink. Neither repair changes the system default audio device or game streams.
+- Drain capture continuously through a bounded nonblocking relay. Pausing
+  OwnTone no longer blocks `parec` behind the FIFO until PulseAudio aborts at
+  its allocation limit, causing repeated capture-container restarts.
+
+- Split PCM capture from Soloist, and split stack lifecycle, playback supervision,
+  and volume handoff into independent services. Downstream faults and monitor
+  restarts no longer terminate Spotify Connect by design.
+- Replace full-stack watchdog resets with scoped recovery, explicit health
+  states, fresh playback checks, buffering grace, and a persisted three-repair
+  budget per ten minutes. Unknown/source-silent observations are not success.
+- Persist explicit output intent across host reboots. Add bounded event history,
+  a supervisor heartbeat checked by doctor, HTTP failure-sequence tests, and a
+  guarded live fault-injection tool that records process/session continuity.
+- Recover active playback after network loss disconnects either or both AirPlay
+  outputs, even when the idle controller did not initiate the disconnect.
+  Explicit CLI stop/local-only intent is now tracked separately and serialized
+  with automatic recovery. Resume OwnTone if a failed output left its bridge
+  PCM queue paused, with bounded retry backoff and a fresh watchdog grace period.
+- Disconnect both AirPlay outputs after 60 seconds of idle Spotify playback,
+  and at supervisor startup if
+  Spotify is idle. This prevents a silent, permanently open AirPlay session
+  from intermittently waking analog speakers. Reconnect only when Soloist is
+  playing and automatic output control is enabled; preserve explicit manual selections.
+  The opt-in keepalive mode retains the previous always-connected behavior.
+- Treat disconnected idle outputs as healthy in the read-only doctor audit,
+  while still flagging missing outputs during playback.
+- Verify exactly one Shairport stream is routed to the configured physical PC
+  sink during active playback. Missing, duplicate, and misrouted receiver
+  streams trigger targeted recovery.
+- Limit Shairport advertisements to the configured speaker-LAN interface so
+  OwnTone does not discover one receiver through every Docker bridge, VPN, and
+  physical address and retain a route through a disappearing interface.
+
 - Wait up to 60 seconds for WirePlumber to enumerate the configured DisplayPort
   sink during boot instead of permanently failing when PipeWire's socket becomes
   ready first.
-- Cold-start the Compose stack on every bridge-service start. Docker can restore
-  `unless-stopped` containers before PipeWire and the user service, leaving
-  OwnTone and the PCM FIFO individually healthy but connected in a stale order.
-  The service now replaces that unordered state before reconciling outputs.
-- Verify active PCM end to end after service startup. When Spotify is producing
-  audio but the physical PC sink remains digitally silent after both source and
-  output grace periods, startup now fails and uses the clean recovery path.
-- Repeat that flow check during active playback and automatically cold-recover
-  after two consecutive confirmed stalls, while treating genuine source silence
-  and a temporarily unavailable diagnostic as non-failures.
+- Verify active PCM after startup and during playback, with grace periods and
+  bounded targeted repairs instead of treating container liveness as success.
+- Run live-flow recovery only while the exact configured PC + WiiM pair is
+  selected, so an intentional `stop` or local-only selection stays intentional.
+- Reset accumulated flow failures across idle playback periods and tolerate a
+  nonblocking monitor read that becomes unavailable after polling.
+- Detect stale socket-file bind mounts after a host PipeWire/Pulse restart,
+  even while idle, and recreate only affected containers after repeat evidence.
+  Recreating Soloist is explicitly counted as a source interruption.
 
 ### Added
 
@@ -28,6 +68,8 @@
 
 ### Security
 
+- Prevent every container from gaining new privileges and drop the Soloist
+  container's unused Linux capability bounding set.
 - Scan the whole Git history for credentials, not just the working tree. A key
   committed once and deleted later was previously reported as clean while every
   clone still carried it. The scan also matches the installation's literal key,
@@ -37,6 +79,8 @@
   reachable from the whole LAN because the containers use host networking.
 - Reject a `SOLOIST_KEY_FILE` inside the repository, where `git add -A` would
   publish it, and drop the redundant `.secrets/` copy of the key entirely.
+- Protect the Pulse authentication cookie with the same outside-repository and
+  mode-600 checks as the Soloist API key, including normalized path validation.
 - Require `TRUSTED_NETWORK` to be a private network with no host bits set. A
   value such as `192.0.2.10/0` was silently widened to `0.0.0.0/0`, which made
   the "speakers are inside the trusted LAN" check accept any address and
@@ -92,6 +136,10 @@
 
 ### Changed
 
+- Preserve the active Spotify volume when playback moves to the PC + WiiM
+  Connect target and retain the last stable level across bridge restarts.
+- License the project under MIT and broaden the architecture and use-case
+  documentation beyond the reference PC + WiiM deployment.
 - Support any number of WiiM followers through the optional `WIIM_FOLLOWERS`
   setting. The group is judged by comparing the leader's reported followers
   against the configured set, so a group with two followers is usable and a
@@ -111,15 +159,6 @@
   configuration with itself and could not fail. Sixteen mutations that
   previously passed unnoticed — including deleting reconcile's verification
   block and the follower-identity check — are now caught.
-
-
-## Unreleased
-
-- Preserve the active Spotify volume when playback moves to the PC + WiiM
-  Connect target and retain the last stable level across bridge restarts.
-- License the project under MIT and broaden the architecture and use-case
-  documentation beyond the reference PC + WiiM deployment.
-
 ## v1.0.1 - 2026-09-13
 
 - Validate configuration structure, paths, volumes, offsets, buffer bounds, and

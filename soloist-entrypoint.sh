@@ -4,26 +4,19 @@
 set -eu
 
 api_key_file=/run/secrets/soloist_api_key
-audio_fifo=/srv/media/spotify.pcm
 sink_name=${BRIDGE_SINK:-wiim_bridge}
 device_name=${SOLOIST_DEVICE_NAME:-PC + WiiM}
 volume_file=/var/lib/soloist/handoff-volume
 initial_volume=40
 module_id=""
-capture_pid=""
 soloist_pid=""
 stop_requested=0
-capture_ready_timeout=30
 
 cleanup() {
-  if [ -n "$capture_pid" ]; then
-    kill "$capture_pid" 2>/dev/null || true
-    wait "$capture_pid" 2>/dev/null || true
-  fi
   if [ -n "$module_id" ]; then
     pactl unload-module "$module_id" 2>/dev/null || true
   fi
-  rm -f /tmp/parec.pid /tmp/soloist-child.pid
+  rm -f /tmp/soloist-child.pid
 }
 
 forward_signal() {
@@ -43,13 +36,6 @@ trap forward_signal INT TERM HUP
 
 if [ ! -s "$api_key_file" ]; then
   echo "Spotify Soloist API key is missing: $api_key_file" >&2
-  exit 1
-fi
-if [ ! -e "$audio_fifo" ]; then
-  mkfifo "$audio_fifo"
-  chmod 0660 "$audio_fifo"
-elif [ ! -p "$audio_fifo" ]; then
-  echo "OwnTone PCM FIFO is missing: $audio_fifo" >&2
   exit 1
 fi
 
@@ -117,38 +103,6 @@ else
     sink_properties=device.description=Spotify_Bridge)
 fi
 
-# Capture only Soloist's sink monitor. parec performs any final format
-# conversion and writes 44,100 Hz, signed 16-bit little-endian stereo PCM.
-parec \
-  --device="${sink_name}.monitor" \
-  --format=s16le \
-  --rate=44100 \
-  --channels=2 \
-  --latency-msec=100 \
-  --process-time-msec=20 \
-  --raw > "$audio_fifo" &
-capture_pid=$!
-echo "$capture_pid" > /tmp/parec.pid
-
-# Opening a FIFO for writing blocks until a reader appears, so until OwnTone
-# opens the pipe this PID is still the forked shell, not parec. Without this
-# gate `kill -0` would report a live capture and the health check would go
-# green while no PCM is flowing at all.
-attempt=0
-until [ "$(cat "/proc/$capture_pid/comm" 2>/dev/null || true)" = parec ]; do
-  if ! kill -0 "$capture_pid" 2>/dev/null; then
-    echo "PCM capture exited before it started" >&2
-    exit 1
-  fi
-  attempt=$((attempt + 1))
-  if [ "$attempt" -ge "$capture_ready_timeout" ]; then
-    echo "No reader opened $audio_fifo after ${capture_ready_timeout}s;" \
-      "OwnTone is not consuming the bridge pipe." >&2
-    exit 1
-  fi
-  sleep 1
-done
-
 /usr/local/bin/soloist \
   --device-name "$device_name" \
   --api-key "$api_key" \
@@ -165,19 +119,8 @@ if [ "$stop_requested" -eq 1 ]; then
   kill -TERM "$soloist_pid" 2>/dev/null || true
 fi
 
-# Supervise both children. Docker only restarts a container when PID 1 exits;
-# a healthcheck alone does not recover a dead capture process.
-while kill -0 "$soloist_pid" 2>/dev/null && kill -0 "$capture_pid" 2>/dev/null; do
-  sleep 2
-done
-
-if ! kill -0 "$capture_pid" 2>/dev/null; then
-  echo "PCM capture stopped unexpectedly; restarting the bridge source" >&2
-  kill -TERM "$soloist_pid" 2>/dev/null || true
-  wait "$soloist_pid" 2>/dev/null || true
-  exit 1
-fi
-
+# Capture is a separate container. A missing FIFO reader must never terminate
+# this Spotify Connect session.
 set +e
 wait "$soloist_pid"
 status=$?

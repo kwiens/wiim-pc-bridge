@@ -23,5 +23,6 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY soloist-entrypoint.sh /usr/local/bin/soloist-entrypoint
+RUN chmod 0755 /usr/local/bin/soloist-entrypoint
 
 ENTRYPOINT ["/usr/local/bin/soloist-entrypoint"]

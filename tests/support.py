@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 import bridge_config
+import output_control
 
 # Deliberately distinct from every default and from each other: equal values
 # let an argument swap pass unnoticed.
@@ -19,6 +20,7 @@ BASE_ENV = {
     "BRIDGE_RUNTIME_DIR": "/run/user/1000",
     "SOLOIST_KEY_FILE": "/home/tester/.config/wiim-pc-bridge/soloist_api_key",
     "PULSE_COOKIE_PATH": "/home/tester/.config/pulse/cookie",
+    "SHAIRPORT_INTERFACE": "eth0",
     "DISPLAYPORT_SINK": "alsa_output.test-card",
     "BRIDGE_SINK": "test_bridge_sink",
     "BRIDGE_FRIENDLY_NAME": "Test Bridge",
@@ -69,7 +71,17 @@ def configured(text: str | None = None, **overrides: str | None) -> Iterator[Pat
             if key not in bridge_config.KNOWN_KEYS
         }
         environment["WIIM_BRIDGE_ENV"] = str(path)
-        with mock.patch.dict(os.environ, environment, clear=True):
+        with (
+            mock.patch.dict(os.environ, environment, clear=True),
+            mock.patch.object(
+                output_control, "control_directory", return_value=Path(directory)
+            ),
+            mock.patch.object(
+                output_control,
+                "policy_path",
+                return_value=Path(directory) / "policy.json",
+            ),
+        ):
             bridge_config.get_config.cache_clear()
             try:
                 yield path

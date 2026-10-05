@@ -52,6 +52,12 @@ class RequestTests(unittest.TestCase):
         with self.assertRaisesRegex(bridge.BridgeError, "malformed JSON"):
             bridge.request("/outputs")
 
+    @mock.patch.object(bridge, "request")
+    def test_malformed_output_entry_is_rejected(self, request: mock.Mock) -> None:
+        request.return_value = {"outputs": [{"id": "1"}, "not-an-output"]}
+        with self.assertRaisesRegex(bridge.BridgeError, "malformed output entry"):
+            bridge.outputs()
+
     @mock.patch.object(bridge.urllib.request, "urlopen")
     def test_a_stall_while_reading_the_body_becomes_a_bridge_error(
         self, urlopen: mock.Mock
@@ -196,6 +202,28 @@ class OutputTests(unittest.TestCase):
         with configured(), self.assertRaisesRegex(bridge.BridgeError, "missing its id"):
             bridge.resolve_target(items, "local")
 
+    def test_configured_outputs_must_have_distinct_ids(self) -> None:
+        items = [
+            output("same", LOCAL, "AirPlay 1"),
+            output("same", WIIM, "AirPlay 2"),
+        ]
+        with configured(), self.assertRaisesRegex(bridge.BridgeError, "same id"):
+            bridge.resolve_pair(items)
+
+    def test_structured_or_boolean_output_id_is_rejected(self) -> None:
+        for identifier in (False, ["42"], {"id": 42}):
+            with self.subTest(identifier=identifier), self.assertRaisesRegex(
+                bridge.BridgeError, "missing its id"
+            ):
+                bridge.output_id({"id": identifier})
+
+    def test_fractional_or_boolean_output_level_is_rejected(self) -> None:
+        for value in (71.9, True, "7.5"):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                bridge.BridgeError, "invalid volume"
+            ):
+                bridge.output_integer({"volume": value}, "volume")
+
     @mock.patch.object(bridge, "request")
     def test_volume_uses_the_documented_per_output_endpoint(
         self, request: mock.Mock
@@ -212,6 +240,119 @@ class OutputTests(unittest.TestCase):
     def test_offset_range_is_enforced(self) -> None:
         with self.assertRaisesRegex(bridge.BridgeError, "between -2000 and 2000"):
             bridge.set_output_offset({"id": "42"}, 2001)
+
+    @mock.patch.object(bridge, "request")
+    def test_offset_url_escapes_the_output_id(self, request: mock.Mock) -> None:
+        bridge.set_output_offset({"id": "speaker/42?all=true"}, 125)
+        request.assert_called_once_with(
+            "/outputs/speaker%2F42%3Fall%3Dtrue",
+            method="PUT",
+            payload={"offset_ms": 125},
+        )
+
+
+class PlayerRecoveryTests(unittest.TestCase):
+    def test_running_player_is_left_alone(self) -> None:
+        with mock.patch.object(
+            bridge, "request", return_value={"state": "play"}
+        ) as request:
+            self.assertFalse(bridge.resume_pcm_playback())
+        request.assert_called_once_with("/player")
+
+    def test_paused_bridge_pipe_is_resumed_and_verified(self) -> None:
+        queue = {
+            "items": [{"id": 42, "data_kind": "pipe", "path": "/srv/media/spotify.pcm"}]
+        }
+        with mock.patch.object(
+            bridge,
+            "request",
+            side_effect=[
+                {"state": "pause", "item_id": 42},
+                queue,
+                None,
+                {"state": "play"},
+            ],
+        ) as request:
+            self.assertTrue(bridge.resume_pcm_playback())
+        self.assertEqual(
+            request.call_args_list,
+            [
+                mock.call("/player"),
+                mock.call("/queue"),
+                mock.call("/player/play", method="PUT"),
+                mock.call("/player"),
+            ],
+        )
+
+    def test_playing_bridge_pipe_is_paused_and_verified(self) -> None:
+        queue = {
+            "items": [{"id": 42, "data_kind": "pipe", "path": "/srv/media/spotify.pcm"}]
+        }
+        with mock.patch.object(
+            bridge,
+            "request",
+            side_effect=[
+                {"state": "play", "item_id": 42},
+                queue,
+                None,
+                {"state": "pause"},
+            ],
+        ) as request:
+            self.assertTrue(bridge.pause_pcm_playback())
+        self.assertEqual(
+            request.call_args_list,
+            [
+                mock.call("/player"),
+                mock.call("/queue"),
+                mock.call("/player/pause", method="PUT"),
+                mock.call("/player"),
+            ],
+        )
+
+    def test_unrelated_queue_is_never_paused(self) -> None:
+        queue = {"items": [{"id": 42, "data_kind": "file", "path": "/other.mp3"}]}
+        with (
+            mock.patch.object(
+                bridge,
+                "request",
+                side_effect=[{"state": "play", "item_id": 42}, queue],
+            ) as request,
+            self.assertRaisesRegex(bridge.BridgeError, "refusing to pause"),
+        ):
+            bridge.pause_pcm_playback()
+        self.assertEqual(request.call_count, 2)
+
+    def test_unrelated_queue_is_never_started(self) -> None:
+        queue = {"items": [{"id": 42, "data_kind": "file", "path": "/other/music.mp3"}]}
+        with (
+            mock.patch.object(
+                bridge,
+                "request",
+                side_effect=[{"state": "pause", "item_id": 42}, queue],
+            ) as request,
+            self.assertRaisesRegex(bridge.BridgeError, "refusing to resume"),
+        ):
+            bridge.resume_pcm_playback()
+        self.assertEqual(request.call_count, 2)
+
+    def test_failed_player_resume_is_reported(self) -> None:
+        queue = {
+            "items": [{"id": 42, "data_kind": "pipe", "path": "/srv/media/spotify.pcm"}]
+        }
+        with (
+            mock.patch.object(
+                bridge,
+                "request",
+                side_effect=[
+                    {"state": "pause", "item_id": 42},
+                    queue,
+                    None,
+                    {"state": "pause"},
+                ],
+            ),
+            self.assertRaisesRegex(bridge.BridgeError, "did not resume"),
+        ):
+            bridge.resume_pcm_playback()
 
 
 class ReconcileTests(unittest.TestCase):
@@ -264,6 +405,20 @@ class ReconcileTests(unittest.TestCase):
                 mock.call.select(state),
             ],
         )
+
+    def test_idle_reconcile_configures_levels_without_airplay_connection(self) -> None:
+        state = self.desired()
+        idle_state = [{**item, "selected": False} for item in state]
+        with (
+            configured(),
+            mock.patch.object(bridge, "validate_wiim_group"),
+            mock.patch.object(bridge, "outputs", side_effect=[state, idle_state]),
+            mock.patch.object(bridge, "set_outputs") as select,
+            mock.patch.object(bridge, "set_output_volume"),
+            mock.patch.object(bridge, "set_output_offset"),
+        ):
+            bridge.reconcile_once(activate=False)
+        select.assert_called_once_with([])
 
     def test_swapped_levels_are_detected_by_the_verification_pass(self) -> None:
         # The second read reports what OwnTone actually kept. If the write went
@@ -329,6 +484,26 @@ class ReconcileTests(unittest.TestCase):
         ):
             bridge.reconcile_once()
 
+    def test_string_selected_state_does_not_pass_verification(self) -> None:
+        refreshed = [
+            output(
+                "local", LOCAL, "AirPlay 1", selected="true", volume=71, offset_ms=125
+            ),
+            output("wiim", WIIM, "AirPlay 2", selected=True, volume=39, offset_ms=-80),
+        ]
+        with (
+            configured(),
+            mock.patch.object(bridge, "validate_wiim_group"),
+            mock.patch.object(
+                bridge, "outputs", side_effect=[self.desired(), refreshed]
+            ),
+            mock.patch.object(bridge, "set_outputs"),
+            mock.patch.object(bridge, "set_output_volume"),
+            mock.patch.object(bridge, "set_output_offset"),
+            self.assertRaisesRegex(bridge.BridgeError, "did not retain"),
+        ):
+            bridge.reconcile_once()
+
     def test_select_all_fails_closed_before_touching_outputs(self) -> None:
         with (
             configured(),
@@ -374,7 +549,7 @@ class ReconcileRetryTests(unittest.TestCase):
     def test_retrying_stops_as_soon_as_it_succeeds(self) -> None:
         attempts = [bridge.BridgeError("not ready"), None]
 
-        def once() -> None:
+        def once(*, activate: bool = True) -> None:
             outcome = attempts.pop(0)
             if outcome is not None:
                 raise outcome

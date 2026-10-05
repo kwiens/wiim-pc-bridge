@@ -83,6 +83,29 @@ class ConfigTests(unittest.TestCase):
         ):
             load_config()
 
+    def test_private_and_physical_sinks_must_be_distinct(self) -> None:
+        with (
+            configured(BRIDGE_SINK="alsa_output.test-card"),
+            self.assertRaisesRegex(ConfigError, "must be different"),
+        ):
+            load_config()
+
+    def test_shairport_interface_must_be_a_linux_interface_name(self) -> None:
+        for value in ("", "bad interface", "interface-name-is-too-long", "eth0;no"):
+            with (
+                self.subTest(value=value),
+                configured(SHAIRPORT_INTERFACE=value),
+                self.assertRaisesRegex(ConfigError, "SHAIRPORT_INTERFACE"),
+            ):
+                load_config()
+
+    def test_control_characters_are_rejected_in_rendered_names(self) -> None:
+        with (
+            configured(WIIM_OUTPUT_NAME="Group\tInjected"),
+            self.assertRaisesRegex(ConfigError, "control characters"),
+        ):
+            load_config()
+
     def test_key_file_inside_the_repository_is_rejected(self) -> None:
         inside = str(bridge_config.PROJECT / "soloist_api_key")
         with (
@@ -95,6 +118,22 @@ class ConfigTests(unittest.TestCase):
         inside = str(bridge_config.PROJECT / ".secrets" / "soloist_api_key")
         with (
             configured(SOLOIST_KEY_FILE=inside),
+            self.assertRaisesRegex(ConfigError, "must live outside the repository"),
+        ):
+            load_config()
+
+    def test_key_path_traversal_back_into_the_repository_is_rejected(self) -> None:
+        inside = str(bridge_config.PROJECT / ".." / bridge_config.PROJECT.name / "key")
+        with (
+            configured(SOLOIST_KEY_FILE=inside),
+            self.assertRaisesRegex(ConfigError, "must live outside the repository"),
+        ):
+            load_config()
+
+    def test_pulse_cookie_inside_the_repository_is_rejected(self) -> None:
+        inside = str(bridge_config.PROJECT / "pulse-cookie")
+        with (
+            configured(PULSE_COOKIE_PATH=inside),
             self.assertRaisesRegex(ConfigError, "must live outside the repository"),
         ):
             load_config()

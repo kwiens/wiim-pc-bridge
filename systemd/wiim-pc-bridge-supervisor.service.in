@@ -1,0 +1,17 @@
+[Unit]
+Description=Independent WiiM bridge playback supervisor
+Requires=wiim-pc-bridge.service
+After=wiim-pc-bridge.service
+PartOf=wiim-pc-bridge.service
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=notify
+NotifyAccess=main
+WatchdogSec=120s
+WorkingDirectory=@PROJECT_DIRECTORY@
+ExecStart=/usr/bin/python3 @PROJECT_DIRECTORY@/bridge_supervisor.py
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=30s

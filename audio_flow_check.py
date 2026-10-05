@@ -8,18 +8,24 @@ import array
 import json
 import os
 import selectors
+import stat
 import subprocess  # nosec B404
 import sys
 import time
 
+import bridge
 from bridge_config import ConfigError, get_config
 
 DOCKER = "/usr/bin/docker"
+PACTL = "/usr/bin/pactl"
 PAREC = "/usr/bin/parec"
 SOLOIST_CONTAINER = "wiim-pc-bridge-soloist"
 SOLOIST_WS = "127.0.0.1:9090"
+# Fixed path inside the pinned Shairport image, not a host temporary file.
+SHAIRPORT_PULSE_SOCKET = "/tmp/pulseaudio.socket"  # nosec B108
 ACTIVE_PEAK = 4
 SAMPLE_SECONDS = 1
+SOCKET_STAT = "%d:%i"
 
 
 def pcm_peak(data: bytes) -> int:
@@ -58,6 +64,50 @@ def soloist_has_active_playback() -> bool:
     return data["is_active"] and data["status"] in ("playing", "buffering")
 
 
+def socket_identity(path: str) -> tuple[int, int]:
+    info = os.stat(path)
+    if not stat.S_ISSOCK(info.st_mode):
+        raise RuntimeError(f"audio endpoint is not a socket: {path}")
+    return info.st_dev, info.st_ino
+
+
+def container_socket_identity(container: str, path: str) -> tuple[int, int]:
+    result = subprocess.run(  # nosec B603
+        [DOCKER, "exec", container, "stat", "-Lc", SOCKET_STAT, path],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    fields = result.stdout.strip().split(":")
+    if len(fields) != 2:
+        raise RuntimeError(f"could not identify {path} in {container}")
+    return int(fields[0]), int(fields[1])
+
+
+def runtime_socket_mounts_current() -> bool:
+    """Detect socket-file bind mounts made stale by a host audio restart."""
+    config = get_config()
+    pulse_socket = str(config.runtime_dir / "pulse/native")
+    pipewire_socket = str(config.runtime_dir / "pipewire-0")
+    try:
+        pulse_identity = socket_identity(pulse_socket)
+        pipewire_identity = socket_identity(pipewire_socket)
+        return (
+            container_socket_identity(SOLOIST_CONTAINER, pulse_socket) == pulse_identity
+            and container_socket_identity(SOLOIST_CONTAINER, pipewire_socket)
+            == pipewire_identity
+            and container_socket_identity(
+                "wiim-pc-bridge-shairport", SHAIRPORT_PULSE_SOCKET
+            )
+            == pulse_identity
+            and container_socket_identity("wiim-pc-bridge-capture", pulse_socket)
+            == pulse_identity
+        )
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+        return False
+
+
 def sample_peaks(devices: tuple[str, ...]) -> dict[str, int]:
     """Capture all monitor devices concurrently for one second."""
     processes: dict[str, subprocess.Popen[bytes]] = {}
@@ -89,7 +139,11 @@ def sample_peaks(devices: tuple[str, ...]) -> dict[str, int]:
         deadline = time.monotonic() + SAMPLE_SECONDS
         while selector.get_map() and time.monotonic() < deadline:
             for key, _mask in selector.select(max(0.0, deadline - time.monotonic())):
-                data = os.read(key.fileobj.fileno(), 65536)
+                try:
+                    data = os.read(key.fileobj.fileno(), 65536)
+                except BlockingIOError:
+                    # Readiness can disappear between select() and read().
+                    continue
                 if data:
                     chunks[key.data].extend(data)
                 else:
@@ -114,10 +168,123 @@ def announce(message: str, *, verbose: bool, error: bool = False) -> None:
         print(message, file=sys.stderr if error else sys.stdout, flush=True)
 
 
+def configured_outputs_selected() -> bool:
+    """Return whether OwnTone is intentionally driving the configured pair."""
+    items = bridge.outputs()
+    local, wiim = bridge.resolve_pair(items)
+    expected_ids = {
+        bridge.output_id(local),
+        bridge.output_id(wiim),
+    }
+    selected_ids = {
+        bridge.output_id(item) for item in items if item.get("selected") is True
+    }
+    return selected_ids == expected_ids
+
+
+def pulse_objects(object_type: str) -> list[dict[str, object]]:
+    """Return one typed Pulse object list from pactl's machine-readable output."""
+    result = subprocess.run(  # nosec B603
+        [PACTL, "-f", "json", "list", object_type],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    payload = json.loads(result.stdout)
+    if not isinstance(payload, list) or not all(
+        isinstance(item, dict) for item in payload
+    ):
+        raise RuntimeError(f"pactl returned malformed {object_type} JSON")
+    return payload
+
+
+def local_receiver_state() -> str:
+    """Describe the local receiver without mistaking a muted route for audio."""
+    config = get_config()
+    sinks = [
+        item
+        for item in pulse_objects("sinks")
+        if item.get("name") == config.displayport_sink
+    ]
+    streams = []
+    for item in pulse_objects("sink-inputs"):
+        properties = item.get("properties")
+        if isinstance(properties, dict) and properties.get("application.name") == (
+            "Shairport Sync"
+        ):
+            streams.append(item)
+    if len(sinks) != 1 or len(streams) != 1:
+        return "route"
+    if streams[0].get("sink") != sinks[0].get("index"):
+        return "route"
+    if streams[0].get("mute") is True:
+        return "muted"
+    if streams[0].get("corked") is True:
+        return "corked"
+    return "ready"
+
+
+def local_receiver_route_current() -> bool:
+    """A mute is a separate fault; the receiver is still correctly routed."""
+    return local_receiver_state() != "route"
+
+
+def wait_for_local_receiver_route(wait_seconds: int) -> bool:
+    """Allow mDNS and OwnTone time to reconnect a restarted local receiver."""
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        if local_receiver_route_current():
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(1.0, remaining))
+
+
 def check_flow(wait_seconds: int, *, verbose: bool = True) -> int:
+    if not runtime_socket_mounts_current():
+        announce(
+            "Audio flow check failed: a container has a stale or unavailable "
+            "PipeWire/Pulse socket mount.",
+            verbose=verbose,
+            error=True,
+        )
+        return 1
+    if not configured_outputs_selected():
+        announce(
+            "Audio flow check skipped: the configured PC + WiiM outputs are not "
+            "selected.",
+            verbose=verbose,
+        )
+        return 0
+    if not wait_for_local_receiver_route(wait_seconds):
+        announce(
+            "Audio flow check failed: the local Shairport receiver is missing, "
+            "duplicated, or routed to the wrong PC sink.",
+            verbose=verbose,
+            error=True,
+        )
+        return 1
+    if local_receiver_state() == "muted":
+        announce(
+            "Audio flow check failed: the local Shairport receiver is muted; "
+            "PC playback cannot be verified.",
+            verbose=verbose,
+            error=True,
+        )
+        return 1
     if not soloist_has_active_playback():
         announce("Audio flow check skipped: Spotify is idle.", verbose=verbose)
         return 0
+    if local_receiver_state() == "corked":
+        announce(
+            "Audio flow check failed: the local Shairport receiver is still "
+            "corked during active playback.",
+            verbose=verbose,
+            error=True,
+        )
+        return 1
 
     config = get_config()
     bridge_monitor = config.bridge_sink + ".monitor"

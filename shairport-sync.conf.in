@@ -1,0 +1,7 @@
+general =
+{
+	// Advertise the local receiver only on the speaker LAN. Advertising on
+	// Docker bridges and VPNs gives OwnTone several addresses for one receiver
+	// and can leave it attached to an interface that later disappears.
+	interface = "@SHAIRPORT_INTERFACE@";
+};

@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import audio_flow_check
+import bridge
+import output_control
 from bridge_config import PROJECT
 
 # All subprocess calls use fixed local argv and never invoke a shell.
@@ -25,6 +27,7 @@ MPRIS_INTERFACE = "org.mpris.MediaPlayer2.Player"
 BUSCTL = "/usr/bin/busctl"
 DOCKER = "/usr/bin/docker"
 SOLOIST_CONTAINER = "wiim-pc-bridge-soloist"
+SHAIRPORT_CONTAINER = "wiim-pc-bridge-shairport"
 SOLOIST_WS = "127.0.0.1:9090"
 VOLUME_FILE = PROJECT / "cache/soloist/data/handoff-volume"
 DEFAULT_VOLUME = 40
@@ -34,13 +37,18 @@ RECONNECT_SECONDS = 2.0
 FLOW_CHECK_INTERVAL = 30.0
 FLOW_CHECK_SECONDS = 5
 FLOW_FAILURE_LIMIT = 2
+PLAYBACK_POLL_INTERVAL = 5.0
+IDLE_DISCONNECT_SECONDS = 60.0
+IDLE_PIPE_PAUSE_SECONDS = 5.0
+RECEIVER_RECONNECT_SECONDS = 30
+RECEIVER_ADVERTISEMENT_SECONDS = 5
 
 stop_requested = False
 trace_process: subprocess.Popen[str] | None = None
 
 
 class PipelineStalled(RuntimeError):
-    """Active source PCM repeatedly failed to reach the local output."""
+    """The managed audio path repeatedly failed its live health probe."""
 
 
 def parse_mpris_volume(output: str) -> int:
@@ -76,12 +84,13 @@ class VolumeTracker:
     pending_volume: int | None = None
     pending_since: float = 0.0
 
-    def observe_activity(self, active: bool) -> int | None:
+    def observe_activity(self, active: bool) -> ActivityChange:
         previous = self.active
         self.active = active
-        if previous is False and active:
-            return self.saved_volume
-        return None
+        return ActivityChange(
+            handoff_volume=self.saved_volume if previous is False and active else None,
+            became_inactive=previous is True and not active,
+        )
 
     def observe_source_volume(self, volume: int, now: float) -> int | None:
         if not 0 <= volume <= 100:
@@ -113,6 +122,115 @@ class FlowFailureTracker:
     def observe(self, failed: bool) -> bool:
         self.consecutive = self.consecutive + 1 if failed else 0
         return self.consecutive >= FLOW_FAILURE_LIMIT
+
+
+@dataclass
+class IdleOutputController:
+    """Manage active playback and quiet idle, honoring explicit manual intent."""
+
+    enabled: bool = True
+    released: bool = False
+    idle_since: float | None = None
+    retry_at: float = 0.0
+    retry_delay: float = PLAYBACK_POLL_INTERVAL
+    pipe_paused: bool = False
+
+    def release(self) -> bool:
+        if not self.enabled:
+            return False
+        with output_control.locked():
+            if not output_control.automatic_enabled():
+                return False
+            items = bridge.outputs()
+            selected_ids = {
+                bridge.output_id(item) for item in items if item.get("selected") is True
+            }
+            if not selected_ids:
+                self.released = True
+                return False
+            pair_ids = {bridge.output_id(item) for item in bridge.resolve_pair(items)}
+            if not selected_ids.issubset(pair_ids):
+                return False
+            bridge.set_outputs([])
+            if any(item.get("selected") is True for item in bridge.outputs()):
+                raise bridge.BridgeError("OwnTone did not release its idle outputs")
+        self.released = True
+        print("Spotify is idle; released the PC and WiiM AirPlay outputs.", flush=True)
+        return True
+
+    def observe(self, playing: bool, now: float) -> bool:
+        if playing:
+            self.idle_since = None
+            self.pipe_paused = False
+            if now < self.retry_at:
+                return False
+            try:
+                with output_control.locked():
+                    if not output_control.automatic_enabled():
+                        return False
+                    items = bridge.outputs()
+                    pair_ids = {
+                        bridge.output_id(item) for item in bridge.resolve_pair(items)
+                    }
+                    selected_ids = {
+                        bridge.output_id(item)
+                        for item in items
+                        if item.get("selected") is True
+                    }
+                    # Leave unrelated user-selected outputs alone. An incomplete
+                    # managed pair, however, may be a network failure, not a stop.
+                    if not selected_ids.issubset(pair_ids):
+                        return False
+                    reconnected = selected_ids != pair_ids
+                    if reconnected:
+                        bridge.reconcile_once()
+                    resumed = bridge.resume_pcm_playback()
+                self.released = False
+                self.retry_at = 0.0
+                self.retry_delay = PLAYBACK_POLL_INTERVAL
+                if reconnected or resumed:
+                    print(
+                        "Recovered active Spotify playback: "
+                        f"outputs reconnected={reconnected}, PCM player resumed={resumed}.",
+                        flush=True,
+                    )
+                return reconnected or resumed
+            except (OSError, RuntimeError, ValueError):
+                self.retry_at = now + self.retry_delay
+                self.retry_delay = min(60.0, self.retry_delay * 2)
+                raise
+        self.retry_at = 0.0
+        self.retry_delay = PLAYBACK_POLL_INTERVAL
+        if not self.enabled:
+            return False
+        if self.idle_since is None:
+            self.idle_since = now
+        if not self.pipe_paused and now - self.idle_since >= IDLE_PIPE_PAUSE_SECONDS:
+            with output_control.locked():
+                if output_control.automatic_enabled():
+                    bridge.pause_pcm_playback()
+                    self.pipe_paused = True
+        if now - self.idle_since >= IDLE_DISCONNECT_SECONDS:
+            self.release()
+        return False
+
+
+@dataclass(frozen=True)
+class ActivityChange:
+    """State edge emitted by Soloist's Spotify Connect activity trace."""
+
+    handoff_volume: int | None = None
+    became_inactive: bool = False
+
+
+@dataclass(frozen=True)
+class OutputSnapshot:
+    """The local output state that must survive a receiver recycle."""
+
+    selected_ids: tuple[str, ...]
+    local_id: str
+    local_volume: int
+    local_offset_ms: int
 
 
 def load_saved_volume(path: Path = VOLUME_FILE) -> int | None:
@@ -194,6 +312,76 @@ def set_soloist_volume(volume: int) -> bool:
     return False
 
 
+def capture_output_snapshot() -> OutputSnapshot | None:
+    items = bridge.outputs()
+    local = bridge.resolve_target(items, "local")
+    if local.get("selected") is not True:
+        return None
+    return OutputSnapshot(
+        selected_ids=tuple(
+            bridge.output_id(item) for item in items if item.get("selected") is True
+        ),
+        local_id=bridge.output_id(local),
+        local_volume=bridge.output_integer(local, "volume"),
+        local_offset_ms=bridge.output_integer(local, "offset_ms"),
+    )
+
+
+def restore_output_snapshot(snapshot: OutputSnapshot) -> None:
+    items = bridge.outputs()
+    by_id = {bridge.output_id(item): item for item in items}
+    missing = set(snapshot.selected_ids).difference(by_id)
+    if missing or snapshot.local_id not in by_id:
+        raise bridge.BridgeError("restarted local receiver did not return to OwnTone")
+    local = by_id[snapshot.local_id]
+    # A rediscovered receiver starts at OwnTone's default 50%. Restore its
+    # prior level and offset before selecting it to avoid an audible burst.
+    bridge.set_output_volume(local, snapshot.local_volume)
+    bridge.set_output_offset(local, snapshot.local_offset_ms)
+    bridge.set_outputs([by_id[identifier] for identifier in snapshot.selected_ids])
+    # OwnTone can replace a permanent receiver's cached device object while
+    # connecting it, which resets the just-applied value to 50%. Reapply after
+    # selection while the source is idle, then verify the complete restoration.
+    bridge.set_output_volume(local, snapshot.local_volume)
+    bridge.set_output_offset(local, snapshot.local_offset_ms)
+    refreshed = bridge.outputs()
+    refreshed_by_id = {bridge.output_id(item): item for item in refreshed}
+    selected_ids = {
+        bridge.output_id(item) for item in refreshed if item.get("selected") is True
+    }
+    refreshed_local = refreshed_by_id.get(snapshot.local_id)
+    if (
+        selected_ids != set(snapshot.selected_ids)
+        or refreshed_local is None
+        or bridge.output_integer(refreshed_local, "volume") != snapshot.local_volume
+        or bridge.output_integer(refreshed_local, "offset_ms")
+        != snapshot.local_offset_ms
+    ):
+        raise bridge.BridgeError("OwnTone did not restore the local output state")
+
+
+def recycle_local_receiver() -> bool:
+    """Discard buffered local audio after Spotify moves to another device."""
+    snapshot = capture_output_snapshot()
+    if snapshot is None:
+        return False
+    subprocess.run(  # nosec B603
+        [DOCKER, "restart", "--time", "10", SHAIRPORT_CONTAINER],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    # The container is running when `docker restart` returns, but its Avahi
+    # advertisement is asynchronous. Let OwnTone observe that identity before
+    # restoring the exact selection it held before the restart.
+    time.sleep(RECEIVER_ADVERTISEMENT_SECONDS)
+    restore_output_snapshot(snapshot)
+    if not audio_flow_check.wait_for_local_receiver_route(RECEIVER_RECONNECT_SECONDS):
+        raise RuntimeError("local Shairport route did not return after recycling")
+    return True
+
+
 def request_stop(_signum: int, _frame: object) -> None:
     global stop_requested
     stop_requested = True
@@ -234,8 +422,6 @@ def monitor_trace(tracker: VolumeTracker) -> None:
     selector = selectors.DefaultSelector()
     selector.register(trace_process.stdout, selectors.EVENT_READ)
     next_sample = time.monotonic() + SAMPLE_INTERVAL
-    next_flow_check = time.monotonic() + FLOW_CHECK_INTERVAL
-    flow_failures = FlowFailureTracker()
     mpris_missing_reported = False
     try:
         while not stop_requested:
@@ -247,7 +433,8 @@ def monitor_trace(tracker: VolumeTracker) -> None:
                 active = parse_trace_activity(line)
                 if active is None:
                     continue
-                desired = tracker.observe_activity(active)
+                change = tracker.observe_activity(active)
+                desired = change.handoff_volume
                 if desired is not None:
                     if set_soloist_volume(desired):
                         print(
@@ -262,37 +449,6 @@ def monitor_trace(tracker: VolumeTracker) -> None:
                         )
 
             now = time.monotonic()
-            if tracker.active is True and now >= next_flow_check:
-                next_flow_check = now + FLOW_CHECK_INTERVAL
-                try:
-                    failed = bool(
-                        audio_flow_check.check_flow(FLOW_CHECK_SECONDS, verbose=False)
-                    )
-                except (
-                    OSError,
-                    RuntimeError,
-                    ValueError,
-                    json.JSONDecodeError,
-                    subprocess.SubprocessError,
-                ) as exc:
-                    flow_failures.observe(False)
-                    print(
-                        f"Live audio flow probe unavailable: {exc}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                else:
-                    if failed:
-                        print(
-                            "Live audio flow probe found active source PCM but "
-                            "a silent PC output.",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                    if flow_failures.observe(failed):
-                        raise PipelineStalled(
-                            "live PCM repeatedly failed to reach the PC output"
-                        )
             if now < next_sample:
                 continue
             next_sample = now + SAMPLE_INTERVAL
@@ -338,9 +494,6 @@ def main() -> int:
     while not stop_requested:
         try:
             monitor_trace(tracker)
-        except PipelineStalled as exc:
-            print(f"Audio pipeline stalled: {exc}", file=sys.stderr, flush=True)
-            return 1
         except (OSError, RuntimeError) as exc:
             if not stop_requested:
                 print(f"Soloist trace unavailable: {exc}", file=sys.stderr, flush=True)

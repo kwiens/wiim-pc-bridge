@@ -28,10 +28,10 @@ first response within a week.
 
 ## Threat model
 
-This project passes a Spotify Soloist API key to the Soloist process. It stores
-that key only in a mode-600 file outside the repository; configuration
-validation rejects a `SOLOIST_KEY_FILE` inside the clone so it cannot be
-committed.
+This project passes a Spotify Soloist API key to the Soloist process and mounts
+the host's Pulse authentication cookie into Shairport. It stores both in
+mode-600 files outside the repository; configuration validation rejects either
+credential path inside the clone so it cannot be committed.
 
 Soloist accepts its API key only as a command-line option, so the key is
 visible in the process table. Container processes are visible in the host's
@@ -39,7 +39,8 @@ visible in the process table. Container processes are visible in the host's
 only members of the `docker` group. Do not run this on a multi-user host.
 Treat membership in the host's Docker group as root-equivalent.
 
-All three containers use host networking. OwnTone's HTTP and DAAP interfaces
+The source, OwnTone, and Shairport containers use host networking; the new
+capture-only container does not. OwnTone's HTTP and DAAP interfaces
 therefore listen on every interface and are gated only by `TRUSTED_NETWORK`,
 which OwnTone matches as a dotted-octet prefix. Configuration validation
 requires that value to be a private `/8`, `/16` or `/24` with no host bits set,

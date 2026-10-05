@@ -4,14 +4,19 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import os
 import re
 import shutil
 import stat
 import subprocess  # nosec B404
+import time
 from pathlib import Path
 
+import audio_flow_check
 import bridge
+import bridge_supervisor
+import output_control
 from bridge_config import PROJECT, ConfigError, get_config
 
 # subprocess is used only for fixed local diagnostic argv; no shell is invoked.
@@ -20,10 +25,13 @@ CONTAINERS = (
     "wiim-pc-bridge-owntone",
     "wiim-pc-bridge-shairport",
     "wiim-pc-bridge-soloist",
+    "wiim-pc-bridge-capture",
 )
 SINK_FIELD = re.compile(r"^\s*Sink:\s*(\d+)\s*$", re.MULTILINE)
+SOURCE_FIELD = re.compile(r"^\s*Source:\s*(\d+)\s*$", re.MULTILINE)
 BUILD_DATE = re.compile(r"\((\d{8})\)")
 EXPIRY_DAYS = 90
+# Fixed supervisor state path inside this project's Soloist container.
 
 failures: list[str] = []
 warnings: list[str] = []
@@ -132,27 +140,31 @@ def ignore_entries(text: str) -> set[str]:
 
 def check_secrets() -> None:
     config = get_config()
-    key_file = config.soloist_key_file
     local_env = PROJECT / ".env"
     try:
-        try:
-            info = key_file.stat()
-        except OSError:
-            report("FAIL", f"missing API key: {key_file}")
-            return
-        if not stat.S_ISREG(info.st_mode) or info.st_size == 0:
-            report("FAIL", f"API key is empty or not a regular file: {key_file}")
-            return
-        mode = stat.S_IMODE(info.st_mode)
-        if mode != 0o600:
-            report("FAIL", f"API key mode is {mode:o}, expected 600: {key_file}")
-            return
-        if (PROJECT / ".git").exists() and is_published(key_file):
-            report(
-                "FAIL",
-                f"API key {key_file} would be published by a clone of this repository",
-            )
-            return
+        for label, credential in (
+            ("API key", config.soloist_key_file),
+            ("Pulse cookie", config.pulse_cookie_path),
+        ):
+            try:
+                info = credential.stat()
+            except OSError:
+                report("FAIL", f"missing {label}: {credential}")
+                return
+            if not stat.S_ISREG(info.st_mode) or info.st_size == 0:
+                report("FAIL", f"{label} is empty or not a regular file: {credential}")
+                return
+            mode = stat.S_IMODE(info.st_mode)
+            if mode != 0o600:
+                report("FAIL", f"{label} mode is {mode:o}, expected 600: {credential}")
+                return
+            if (PROJECT / ".git").exists() and is_published(credential):
+                report(
+                    "FAIL",
+                    f"{label} {credential} would be published by a clone of this "
+                    "repository",
+                )
+                return
 
         try:
             env_info = local_env.stat()
@@ -185,7 +197,7 @@ def check_secrets() -> None:
                 return
         report(
             "PASS",
-            "API key and local config use mode 600 and are ignored by Git and Docker",
+            "credentials and local config use mode 600 and are not publishable",
         )
     except Exception as exc:
         report("FAIL", f"secret checks failed: {exc}")
@@ -227,11 +239,14 @@ def check_startup() -> None:
             "systemctl",
             "--user",
             "show",
-            "wiim-pc-bridge.service",
+            "wiim-pc-bridge-supervisor.service",
             "--property=MainPID",
             "--value",
         )
         monitor_running = main_pid.isdigit() and int(main_pid) > 0
+        volume_active = probe(
+            "systemctl", "--user", "is-active", "wiim-pc-bridge-volume.service"
+        )
         if enabled == "not-found":
             # The boot service is an optional install step, not a fault.
             report(
@@ -244,10 +259,11 @@ def check_startup() -> None:
             and enabled == "enabled"
             and active == "active"
             and monitor_running
+            and volume_active == "active"
         ):
             report(
                 "PASS",
-                "boot service and volume handoff monitor are active with user "
+                "stack, independent supervisor, and volume helper are active with user "
                 "lingering enabled",
             )
         else:
@@ -255,7 +271,7 @@ def check_startup() -> None:
                 "FAIL",
                 "boot service state is "
                 f"linger={linger}, enabled={enabled}, active={active}, "
-                f"monitor_pid={main_pid or 'none'}",
+                f"monitor_pid={main_pid or 'none'}, volume={volume_active}",
             )
 
         wrong_policy = []
@@ -284,9 +300,49 @@ def check_startup() -> None:
         report("FAIL", f"startup checks failed: {exc}")
 
 
+def check_supervisor() -> None:
+    path = PROJECT / "runtime/supervisor-status.json"
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+        age = time.time() - float(state["updated_at"])
+        if age < -5 or age > 120:
+            report(
+                "FAIL",
+                "supervisor heartbeat is stale; process health alone is insufficient",
+            )
+        elif state["state"] in ("degraded", "stopped"):
+            report("FAIL", f"supervisor {state['state']}: {state['detail']}")
+        elif state["state"] in ("starting", "recovering", "connecting", "unverified"):
+            report("WARN", f"supervisor {state['state']}: {state['detail']}")
+        else:
+            report("PASS", f"supervisor {state['state']}: {state['detail']}")
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        report("FAIL", f"supervisor state unavailable: {exc}")
+
+
 def block_sink_id(block: str) -> str | None:
     match = SINK_FIELD.search(block)
     return match.group(1) if match else None
+
+
+def block_source_id(block: str) -> str | None:
+    match = SOURCE_FIELD.search(block)
+    return match.group(1) if match else None
+
+
+def block_property(block: str, name: str) -> str | None:
+    match = re.search(
+        rf'^\s*{re.escape(name)}\s*=\s*"([^"]*)"\s*$', block, re.MULTILINE
+    )
+    return match.group(1) if match else None
+
+
+def block_muted(block: str) -> bool:
+    return re.search(r"^\s*Mute:\s*yes\s*$", block, re.MULTILINE) is not None
+
+
+def block_corked(block: str) -> bool:
+    return re.search(r"^\s*Corked:\s*yes\s*$", block, re.MULTILINE) is not None
 
 
 def check_audio_routes() -> None:
@@ -294,6 +350,14 @@ def check_audio_routes() -> None:
     expected_default = config.displayport_sink
     expected_bridge = config.bridge_sink
     try:
+        if audio_flow_check.runtime_socket_mounts_current():
+            report("PASS", "container audio socket mounts match the live host sockets")
+        else:
+            report(
+                "FAIL",
+                "a container has a stale or unavailable PipeWire/Pulse socket mount",
+            )
+
         default_sink = run("pactl", "get-default-sink")
         if default_sink != expected_default:
             report(
@@ -325,21 +389,58 @@ def check_audio_routes() -> None:
             return
         default_id = default_line[0]
         bridge_id = bridge_line[0]
+        source_rows = [
+            fields
+            for line in run("pactl", "list", "short", "sources").splitlines()
+            if len(fields := line.split()) >= 2
+        ]
+        bridge_monitor = next(
+            (
+                fields
+                for fields in source_rows
+                if fields[1] == expected_bridge + ".monitor"
+            ),
+            None,
+        )
+        if bridge_monitor is None:
+            report(
+                "FAIL", f"private bridge monitor {expected_bridge}.monitor is missing"
+            )
+            return
 
+        capture_process = run(
+            "docker",
+            "exec",
+            "wiim-pc-bridge-capture",
+            "cat",
+            "/proc/1/comm",
+        )
+        if capture_process != "python3":
+            report(
+                "FAIL", "capture relay is not running as the container's main process"
+            )
+            return
         source_blocks = run("pactl", "list", "source-outputs").split("\n\n")
         capture = [
-            block for block in source_blocks if 'application.name = "parec"' in block
+            block
+            for block in source_blocks
+            if block_property(block, "application.name") == "parec"
+            and block_property(block, "application.id") == "wiim-pc-bridge.capture"
         ]
-        if not capture:
+        if len(capture) != 1:
             report("FAIL", "PCM capture stream is missing")
-        elif not all(
-            'node.latency = "4410/44100"' in block
-            and 'pulse.attr.fragsize = "17640"' in block
-            for block in capture
+        elif not (
+            block_property(capture[0], "target.object") == expected_bridge
+            and block_source_id(capture[0]) == bridge_monitor[0]
+            and "Sample Specification: s16le 2ch 44100Hz" in capture[0]
+            and 'node.latency = "4410/44100"' in capture[0]
+            and 'pulse.attr.fragsize = "17640"' in capture[0]
         ):
-            # Check within the parec record; an unrelated stream elsewhere in
-            # the dump must not satisfy this.
-            report("FAIL", "PCM capture is not using the tested 100 ms buffer")
+            report(
+                "FAIL",
+                f"PCM capture is not routed from {expected_bridge} at the tested "
+                "44.1 kHz/100 ms format",
+            )
         else:
             report("PASS", "PCM capture is 44.1 kHz stereo with a 100 ms buffer")
 
@@ -355,12 +456,50 @@ def check_audio_routes() -> None:
             ]
             if not blocks:
                 report("WARN", f"{binary} is idle; no live route to verify")
-            elif all(block_sink_id(block) == expected_id for block in blocks):
+            elif len(blocks) > 1:
+                report(
+                    "FAIL",
+                    f"{binary} has {len(blocks)} simultaneous sink inputs; "
+                    "expected exactly one",
+                )
+            elif block_sink_id(blocks[0]) == expected_id:
                 report("PASS", f"{binary} is routed only to {label}")
+                if binary == "shairport-sync" and block_muted(blocks[0]):
+                    report(
+                        "FAIL"
+                        if audio_flow_check.soloist_has_active_playback()
+                        else "WARN",
+                        "local Shairport receiver is muted; PC bridge audio is blocked",
+                    )
+                elif (
+                    binary == "shairport-sync"
+                    and block_corked(blocks[0])
+                    and audio_flow_check.soloist_has_active_playback()
+                ):
+                    report(
+                        "FAIL",
+                        "local Shairport receiver is still corked during active playback",
+                    )
             else:
                 report("FAIL", f"{binary} is not routed to {label}")
     except Exception as exc:
         report("FAIL", f"audio route checks failed: {exc}")
+
+
+def check_desktop_spotify_audio() -> None:
+    """Flag a silent desktop player that can hide behind a healthy bridge."""
+    try:
+        if audio_flow_check.soloist_has_active_playback():
+            return  # The bridge intentionally mutes a conflicting desktop player.
+        streams = bridge_supervisor.Runtime().desktop_spotify_streams()
+        if any(stream["mute"] for stream in streams):
+            report(
+                "WARN",
+                "desktop Spotify is muted while the bridge is idle; "
+                "direct PC playback may be silent",
+            )
+    except Exception as exc:
+        report("WARN", f"desktop Spotify mute check unavailable: {exc}")
 
 
 def check_outputs() -> None:
@@ -368,18 +507,42 @@ def check_outputs() -> None:
     try:
         outputs = owntone_outputs()
         try:
-            local = bridge.resolve_target(outputs, "local")
-            wiim = bridge.resolve_target(outputs, "wiim")
+            local, wiim = bridge.resolve_pair(outputs)
         except bridge.BridgeError as exc:
             report("FAIL", str(exc))
             return
         report("PASS", "OwnTone output identities and types match the tested topology")
 
         expected_ids = {bridge.output_id(local), bridge.output_id(wiim)}
-        selected = [item for item in outputs if bool(item.get("selected"))]
+        selected = [item for item in outputs if item.get("selected") is True]
         selected_ids = {bridge.output_id(item) for item in selected}
         if selected_ids == expected_ids:
             report("PASS", "exactly the PC and WiiM leader outputs are selected")
+        elif not output_control.automatic_enabled() and selected_ids.issubset(
+            {bridge.output_id(local)}
+        ):
+            report(
+                "PASS",
+                "explicit manual output selection is active; automatic reconnection is suspended",
+            )
+        elif not selected_ids:
+            try:
+                playing = audio_flow_check.soloist_has_active_playback()
+            except (
+                OSError,
+                RuntimeError,
+                ValueError,
+                subprocess.SubprocessError,
+            ) as exc:
+                report("WARN", f"cannot verify idle output selection: {exc}")
+            else:
+                if playing or config.keepalive_enabled:
+                    report(
+                        "FAIL",
+                        "bridge outputs are disconnected when they should be selected",
+                    )
+                else:
+                    report("PASS", "idle AirPlay outputs are disconnected")
         else:
             # Any unexpected selected output breaks the project's central
             # invariant, including a follower OwnTone discovered on its own.
@@ -500,7 +663,9 @@ def main() -> int:
     check_secrets()
     check_containers()
     check_startup()
+    check_supervisor()
     check_audio_routes()
+    check_desktop_spotify_audio()
     check_outputs()
     check_topology()
     check_soloist_expiry()

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
+import audio_flow_check
 import bridge
 import doctor
+import output_control
 from tests.support import configured
 
 LOCAL = "Test PC Output"
@@ -50,6 +53,42 @@ class DoctorTestCase(unittest.TestCase):
 
 
 class OutputAuditTests(DoctorTestCase):
+    def test_explicit_manual_stop_is_not_an_output_failure(self) -> None:
+        state = [{**item, "selected": False} for item in desired_outputs()]
+        with configured(), mock.patch.object(
+            doctor, "owntone_outputs", return_value=state
+        ):
+            output_control.set_automatic(False)
+            doctor.check_outputs()
+        self.assertEqual(doctor.failures, [])
+
+    def test_idle_outputs_may_be_disconnected(self) -> None:
+        state = [{**item, "selected": False} for item in desired_outputs()]
+        with (
+            configured(),
+            mock.patch.object(doctor, "owntone_outputs", return_value=state),
+            mock.patch.object(
+                audio_flow_check, "soloist_has_active_playback", return_value=False
+            ),
+        ):
+            doctor.check_outputs()
+        self.assertEqual(doctor.failures, [])
+
+    def test_disconnected_outputs_during_playback_are_a_failure(self) -> None:
+        state = [{**item, "selected": False} for item in desired_outputs()]
+        with (
+            configured(),
+            mock.patch.object(doctor, "owntone_outputs", return_value=state),
+            mock.patch.object(
+                audio_flow_check, "soloist_has_active_playback", return_value=True
+            ),
+        ):
+            doctor.check_outputs()
+        self.assertIn(
+            "bridge outputs are disconnected when they should be selected",
+            doctor.failures,
+        )
+
     def test_a_healthy_pair_produces_no_failures_or_warnings(self) -> None:
         with (
             configured(),
@@ -103,6 +142,21 @@ class OutputAuditTests(DoctorTestCase):
         ):
             doctor.check_outputs()
         self.assertEqual(doctor.failures, [])
+
+    def test_malformed_selected_state_does_not_count_as_selected(self) -> None:
+        state = desired_outputs()
+        state[0]["selected"] = "true"
+        with (
+            configured(),
+            mock.patch.object(doctor, "owntone_outputs", return_value=state),
+        ):
+            doctor.check_outputs()
+        self.assertEqual(
+            doctor.failures,
+            [
+                "selected OwnTone outputs differ from the desired pair: the pair is incomplete"
+            ],
+        )
 
     def test_a_wrong_volume_is_reported_with_both_values(self) -> None:
         state = desired_outputs()
@@ -178,6 +232,48 @@ class ContainerAuditTests(DoctorTestCase):
             doctor.check_containers()
         self.assertEqual(doctor.failures, [])
         self.assertEqual(doctor.warnings, [])
+
+
+class SecretAuditTests(DoctorTestCase):
+    def prepare_files(self, root: Path) -> tuple[Path, Path, Path]:
+        project = root / "project"
+        project.mkdir()
+        (project / ".env").write_text("private configuration\n", encoding="utf-8")
+        (project / ".env").chmod(0o600)
+        (project / ".gitignore").write_text(
+            ".env\ncache/\nruntime/\n", encoding="utf-8"
+        )
+        (project / ".dockerignore").write_text(
+            ".git\n.env\ncache\nruntime\n", encoding="utf-8"
+        )
+        key = root / "soloist-key"
+        cookie = root / "pulse-cookie"
+        for credential in (key, cookie):
+            credential.write_text("not-a-real-secret\n", encoding="ascii")
+            credential.chmod(0o600)
+        return project, key, cookie
+
+    def test_both_credentials_and_local_config_are_private(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, key, cookie = self.prepare_files(Path(directory))
+            with (
+                configured(SOLOIST_KEY_FILE=str(key), PULSE_COOKIE_PATH=str(cookie)),
+                mock.patch.object(doctor, "PROJECT", project),
+            ):
+                doctor.check_secrets()
+        self.assertEqual(doctor.failures, [])
+
+    def test_public_pulse_cookie_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, key, cookie = self.prepare_files(Path(directory))
+            cookie.chmod(0o644)
+            with (
+                configured(SOLOIST_KEY_FILE=str(key), PULSE_COOKIE_PATH=str(cookie)),
+                mock.patch.object(doctor, "PROJECT", project),
+            ):
+                doctor.check_secrets()
+        self.assertEqual(len(doctor.failures), 1)
+        self.assertIn("Pulse cookie mode is 644", doctor.failures[0])
 
 
 class StartupAuditTests(DoctorTestCase):
@@ -271,6 +367,106 @@ class SinkMatchingTests(unittest.TestCase):
 
     def test_a_block_without_a_sink_field_returns_none(self) -> None:
         self.assertIsNone(doctor.block_sink_id("Sink Input #7\n\tMute: no"))
+
+    def test_actual_capture_source_is_matched_not_target_hint(self) -> None:
+        block = 'Source Output #7\n\tSource: 330807\n\ttarget.object = "wiim_bridge"'
+        self.assertEqual(doctor.block_source_id(block), "330807")
+        self.assertNotEqual(doctor.block_source_id(block), "52")
+
+    def test_mute_field_is_matched_exactly(self) -> None:
+        self.assertTrue(doctor.block_muted("Sink Input #7\n\tMute: yes"))
+        self.assertFalse(doctor.block_muted("Sink Input #7\n\tMute: no"))
+        self.assertFalse(doctor.block_muted("NotMute: yes"))
+
+    def test_corked_field_is_matched_exactly(self) -> None:
+        self.assertTrue(doctor.block_corked("Sink Input #7\n\tCorked: yes"))
+        self.assertFalse(doctor.block_corked("Sink Input #7\n\tCorked: no"))
+        self.assertFalse(doctor.block_corked("NotCorked: yes"))
+
+    def test_properties_are_matched_exactly(self) -> None:
+        block = (
+            'application.process.id = "142"\n'
+            'application.process.id.extra = "42"\n'
+            'target.object = "wiim_bridge"'
+        )
+        self.assertEqual(doctor.block_property(block, "application.process.id"), "142")
+        self.assertEqual(doctor.block_property(block, "target.object"), "wiim_bridge")
+        self.assertIsNone(doctor.block_property(block, "missing"))
+
+
+class DesktopAudioAuditTests(DoctorTestCase):
+    def test_idle_muted_desktop_spotify_is_visible(self) -> None:
+        with (
+            configured(),
+            mock.patch.object(
+                audio_flow_check, "soloist_has_active_playback", return_value=False
+            ),
+            mock.patch.object(
+                doctor.bridge_supervisor.Runtime,
+                "desktop_spotify_streams",
+                return_value=[{"index": 80, "mute": True}],
+            ),
+        ):
+            doctor.check_desktop_spotify_audio()
+        self.assertEqual(doctor.failures, [])
+        self.assertEqual(len(doctor.warnings), 1)
+        self.assertIn("desktop Spotify is muted", doctor.warnings[0])
+
+    def test_bridge_owned_desktop_mute_is_not_flagged_during_playback(self) -> None:
+        with (
+            mock.patch.object(
+                audio_flow_check, "soloist_has_active_playback", return_value=True
+            ),
+            mock.patch.object(
+                doctor.bridge_supervisor.Runtime, "desktop_spotify_streams"
+            ) as streams,
+        ):
+            doctor.check_desktop_spotify_audio()
+        streams.assert_not_called()
+        self.assertEqual(doctor.warnings, [])
+
+
+class CaptureRouteAuditTests(DoctorTestCase):
+    def test_requested_bridge_target_does_not_hide_actual_pc_capture(self) -> None:
+        with configured():
+            config = doctor.get_config()
+            source_output = (
+                "Source Output #7\n"
+                "\tSource: 99\n"
+                "\tSample Specification: s16le 2ch 44100Hz\n"
+                '\tapplication.name = "parec"\n'
+                '\tapplication.id = "wiim-pc-bridge.capture"\n'
+                f'\ttarget.object = "{config.bridge_sink}"\n'
+                '\tnode.latency = "4410/44100"\n'
+                '\tpulse.attr.fragsize = "17640"'
+            )
+
+            def fake_run(*args: str) -> str:
+                if args == ("pactl", "get-default-sink"):
+                    return config.displayport_sink
+                if args == ("pactl", "list", "short", "sinks"):
+                    return f"41 {config.displayport_sink}\n42 {config.bridge_sink}"
+                if args == ("pactl", "list", "short", "sources"):
+                    return f"52 {config.bridge_sink}.monitor\n99 pc.monitor"
+                if args[:3] == ("docker", "exec", "wiim-pc-bridge-capture"):
+                    return "python3"
+                if args == ("pactl", "list", "source-outputs"):
+                    return source_output
+                if args == ("pactl", "list", "sink-inputs"):
+                    return ""
+                raise AssertionError(args)
+
+            with (
+                mock.patch.object(doctor, "run", side_effect=fake_run),
+                mock.patch.object(
+                    audio_flow_check, "runtime_socket_mounts_current", return_value=True
+                ),
+            ):
+                doctor.check_audio_routes()
+        self.assertTrue(
+            any("PCM capture is not routed" in item for item in doctor.failures),
+            doctor.failures,
+        )
 
 
 class PublishedPathTests(unittest.TestCase):

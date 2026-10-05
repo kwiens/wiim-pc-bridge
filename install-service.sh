@@ -2,45 +2,43 @@
 set -eu
 
 service_name=wiim-pc-bridge.service
-if [ "$#" -gt 1 ]; then
-  echo "Usage: $0 [--keepalive]" >&2
-  exit 2
-fi
+units="wiim-pc-bridge-supervisor.service wiim-pc-bridge-volume.service wiim-pc-bridge.service"
 case "$*" in
   '') ;;
-  --keepalive) service_name=wiim-pc-bridge-keepalive.service ;;
+  --keepalive) service_name=wiim-pc-bridge-keepalive.service; units="$service_name" ;;
   *) echo "Usage: $0 [--keepalive]" >&2; exit 2 ;;
 esac
-
 project_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
-template="$project_directory/systemd/$service_name.in"
+case "$project_directory" in
+  *[[:space:]]* | *'|'* | *'&'* | *'"'* | *"'"* | *';'* | *'%'* | *'$'* | *'`'* | *\\*)
+    echo "Project path contains characters systemd would reinterpret" >&2
+    exit 1 ;;
+esac
 unit_directory=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
-unit_file="$unit_directory/$service_name"
-temporary_file=""
-backup_file=""
-unit_replaced=0
-service_touched=0
-verification_output=""
-previous_enabled=0
+mkdir -p "$unit_directory"
+staging=$(mktemp -d "$unit_directory/.wiim-install.XXXXXX")
+changed=""
+committed=0
+touched=0
 previous_active=0
+previous_enabled=0
+systemctl --user is-active --quiet "$service_name" && previous_active=1
+systemctl --user is-enabled --quiet "$service_name" 2>/dev/null && previous_enabled=1
 
 cleanup() {
-  if [ "$unit_replaced" -eq 1 ]; then
-    if [ -n "$backup_file" ] && [ -e "$backup_file" ]; then
-      cp "$backup_file" "$unit_file" || true
-    else
-      rm -f "$unit_file"
-    fi
+  if [ "$committed" -eq 0 ] && [ -n "$changed" ]; then
+    for unit in $changed; do
+      if [ -f "$staging/$unit.backup" ]; then
+        cp "$staging/$unit.backup" "$unit_directory/$unit" || true
+      else
+        rm -f "$unit_directory/$unit"
+      fi
+    done
     systemctl --user daemon-reload || true
-    if [ "$previous_enabled" -eq 1 ]; then
-      systemctl --user enable "$service_name" || true
-    else
+    if [ "$previous_enabled" -eq 0 ]; then
       systemctl --user disable "$service_name" || true
     fi
-    # Only disturb the running service if this script actually restarted it.
-    # A failure earlier than that left a healthy bridge running, and stopping
-    # or restarting it here would be strictly worse than doing nothing.
-    if [ "$service_touched" -eq 1 ]; then
+    if [ "$touched" -eq 1 ]; then
       if [ "$previous_active" -eq 1 ]; then
         systemctl --user restart "$service_name" || true
       else
@@ -48,56 +46,36 @@ cleanup() {
       fi
     fi
   fi
-  if [ -n "$temporary_file" ] && [ -e "$temporary_file" ]; then
-    rm -f "$temporary_file"
-  fi
-  if [ -n "$backup_file" ] && [ -e "$backup_file" ]; then
-    rm -f "$backup_file"
-  fi
+  for unit in $units; do
+    rm -f "$staging/$unit" "$staging/$unit.backup"
+  done
+  rmdir "$staging" 2>/dev/null || true
 }
 trap cleanup EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-# The path is substituted into a systemd unit, where '%' introduces a specifier
-# and '$' introduces variable expansion in Exec* lines -- both silently rewrite
-# the path rather than failing. The rest are hostile to sed or to Exec quoting.
-case "$project_directory" in
-  *[[:space:]]* | *'|'* | *'&'* | *'"'* | *"'"* | *';'* | *'%'* | *'$'* | *'`'* | *\\*)
-    echo "The project path contains whitespace or a character that systemd or" \
-      "sed would reinterpret: $project_directory" >&2
-    exit 1
-    ;;
-esac
-
-mkdir -p "$unit_directory"
-if systemctl --user is-enabled --quiet "$service_name" 2>/dev/null; then
-  previous_enabled=1
-fi
-if systemctl --user is-active --quiet "$service_name" 2>/dev/null; then
-  previous_active=1
-fi
-temporary_file=$(mktemp "$unit_directory/wiim-pc-bridge.XXXXXX.service")
-sed "s|@PROJECT_DIRECTORY@|$project_directory|g" "$template" > "$temporary_file"
-chmod 0644 "$temporary_file"
-if ! verification_output=$(systemd-analyze --user verify "$temporary_file" 2>&1); then
-  printf '%s\n' "$verification_output" >&2
-  exit 1
-fi
-
-if [ -e "$unit_file" ]; then
-  backup_file=$(mktemp "$unit_directory/.wiim-pc-bridge.backup.XXXXXX")
-  cp "$unit_file" "$backup_file"
-fi
-mv -f "$temporary_file" "$unit_file"
-temporary_file=""
-unit_replaced=1
-
+for unit in $units; do
+  sed "s|@PROJECT_DIRECTORY@|$project_directory|g" \
+    "$project_directory/systemd/$unit.in" > "$staging/$unit"
+  chmod 0644 "$staging/$unit"
+  if [ -f "$unit_directory/$unit" ]; then
+    cp "$unit_directory/$unit" "$staging/$unit.backup"
+  fi
+done
+# Resolve sibling unit dependencies from the staging directory during verify.
+SYSTEMD_UNIT_PATH="$staging:" systemd-analyze --user verify "$staging/$service_name"
+for unit in $units; do
+  changed="$changed $unit"
+  cp "$staging/$unit" "$unit_directory/$unit"
+done
 systemctl --user daemon-reload
 systemctl --user enable "$service_name"
-service_touched=1
+touched=1
 systemctl --user restart "$service_name"
-unit_replaced=0
-service_touched=0
-echo "Installed and started $unit_file"
+if [ "$service_name" = wiim-pc-bridge.service ]; then
+  systemctl --user start wiim-pc-bridge-supervisor.service wiim-pc-bridge-volume.service
+fi
+committed=1
+echo "Installed $units"

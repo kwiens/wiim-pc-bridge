@@ -15,7 +15,7 @@ Connect handoffs, and restores the working topology after a reboot.
 ```mermaid
 flowchart TB
     spotify(["Spotify apps<br/>phone · desktop · web"])
-    pipeline["Linux bridge host<br/><br/>Soloist receiver → private PipeWire sink → PCM FIFO → OwnTone<br/>volume-preserving handoff · buffered, clocked fan-out"]
+    pipeline["Linux bridge host<br/><br/>Soloist → private PipeWire sink → independent PCM capture → OwnTone<br/>separate source, transport, supervisor, and volume-helper lifetimes"]
     local(["Local path · AirPlay 1<br/>Shairport Sync → PipeWire<br/>HDMI · USB DAC · analog"])
     leader(["Network path · AirPlay 2<br/>compatible speaker or native group leader"])
     followers(["Optional native follower speakers"])
@@ -130,13 +130,21 @@ installation). Useful controls are:
 
 `reconcile` verifies the native WiiM topology before restoring the two selected
 outputs, their volumes, and their sync offsets from `.env`. The boot service
-waits up to three minutes for OwnTone and the WiiMs, then runs this command.
+starts the containers; the independent supervisor then reconciles observed
+playback with the desired output mode.
 
 `select-all` also fails closed unless the configured leader and follower
 topology is healthy. Its confirmation flag acknowledges that starting AirPlay
 will replace whatever source is currently active on the WiiM leader.
 
 `stop` deselects OwnTone outputs without changing native WiiM group membership.
+Both `stop` and `select-local` suspend automatic reconnection using an explicit
+persistent policy, so a network failure is no longer mistaken for a user command.
+Use these commands for manual selection; direct OwnTone UI changes to the
+configured pair cannot reliably be distinguished from a failed connection.
+`select-all` or `reconcile` re-enables automatic recovery. The marker survives
+service restarts and host reboots. CLI and supervisor output changes are
+serialized to avoid competing selections.
 Positive offsets delay that output; valid offsets are -2000 through 2000 ms.
 
 ## Configuration
@@ -146,6 +154,7 @@ Positive offsets delay that output; valid offsets are -2000 through 2000 ms.
 | Setting | Purpose |
 | --- | --- |
 | `DISPLAYPORT_SINK` | Stable PipeWire sink used by the local Shairport stream |
+| `SHAIRPORT_INTERFACE` | Linux interface that reaches the speaker LAN; excludes Docker/VPN advertisements |
 | `KITCHEN_IP`, `LIVING_ROOM_IP` | Reserved addresses used for fail-closed topology checks |
 | `KITCHEN_DEVICE_NAME` | AirPlay service name advertised by the WiiM leader |
 | `WIIM_FOLLOWERS` | Optional `ADDRESS=Name` list for groups with more than one follower |
@@ -168,16 +177,17 @@ By default the group is one leader and one follower, taken from the
 number:
 
 ```bash
-WIIM_FOLLOWERS=192.168.1.11=Living Room,192.168.1.12=Patio
+WIIM_FOLLOWERS=192.0.2.11=Follower One,192.0.2.12=Follower Two
 ```
 
 Reconciliation compares the leader's reported followers against exactly this
 set and refuses to select the WiiM output on any mismatch, naming what is
 missing and what is unexpected.
 
-The Soloist key lives only at the path configured by `SOLOIST_KEY_FILE`, which
-must be outside the clone; configuration validation rejects a path inside it so
-the key cannot be committed by a stray `git add -A`.
+The Soloist key and Pulse authentication cookie live only at the paths
+configured by `SOLOIST_KEY_FILE` and `PULSE_COOKIE_PATH`. Both must be outside
+the clone; configuration validation rejects paths inside it so neither
+credential can be committed by a stray `git add -A`.
 
 ## Reliability model
 
@@ -186,37 +196,144 @@ the key cannot be committed by a stray `git add -A`.
   entrypoint refuses to capture from a pre-existing sink of that name whose
   format does not match.
 - PCM capture uses 44.1 kHz signed 16-bit stereo and a tested 100 ms fragment.
+- A small relay drains the capture client continuously and discards PCM when
+  OwnTone pauses or closes its FIFO. It does not queue minutes of stale game or
+  Spotify audio, or let a blocked writer grow PulseAudio's buffers until abort.
 - OwnTone uses a configurable 2250 ms startup buffer by default.
-- The Soloist entrypoint supervises both Soloist and `parec`; either child
-  exiting restarts the container.
+- Soloist and PCM capture run in **separate containers**. Losing the FIFO reader
+  or restarting OwnTone can restart capture without killing Spotify Connect.
 - Shairport uses classic AirPlay to avoid competing with OwnTone for AirPlay 2
-  PTP services. Its Pulse backend shares the selected PC sink with desktop audio.
-- All containers use `unless-stopped`; systemd waits for PipeWire, Docker, and
-  the configured physical output. Because Docker may independently restore
-  those containers earlier in boot, every service start first stops that
-  unordered state and then cold-starts the Compose dependency graph. OwnTone
-  and the FIFO writer therefore rendezvous before outputs are selected.
-- Startup reconciliation restores output selection, volume and offsets rather
-  than relying only on OwnTone's cache database.
-- When Spotify is already active during startup, a post-start probe samples the
-  private sink and physical PC output concurrently. Active source PCM followed
-  by persistent digital silence fails the unit, invoking the clean restart path
-  instead of accepting a superficially healthy pipeline.
-- The volume handoff monitor repeats the same live-signal check during active
-  playback. Two consecutive stalled-flow results fail the service and trigger a
-  complete cold recovery; silence, buffering, or an unavailable probe does not.
-- The host-side handoff monitor preserves Spotify's source volume when Soloist
-  becomes active and stores only the numeric level for the next restart.
-- `doctor.py` audits secrets, containers, startup, audio routing, output state,
-  WiiM topology, and Soloist expiry without changing the system.
+  PTP services. Its Pulse backend shares the selected PC sink with desktop audio,
+  and its receiver advertisement is limited to the configured speaker-LAN
+  interface so OwnTone cannot attach through transient Docker or VPN addresses.
+- Three independent user units own stack lifecycle, playback supervision, and
+  volume handoffs. A failed volume trace cannot stop playback supervision.
+  Restarting either helper does not stop any audio container.
+  Failed boot prerequisites retry every 30 seconds without cold-stopping the
+  containers that are already running.
+- The supervisor checks container/socket health, desired output mode, OwnTone's
+  player state, the WiiM group/transport, the actual Soloist sink, and live PC
+  PCM. It reports `idle`,
+  `manual`, `connecting`, `playing`, `unverified`, `recovering`, or `degraded`.
+  Silence is **unverified**, not proof of successful playback or a reason to
+  restart. PC PCM plus a WiiM transport response cannot prove analog speaker
+  audibility; listening remains part of acceptance testing.
+- Recovery is scoped: reconnect outputs/resume the pipe, restart a failed
+  receiver, then recover OwnTone/capture if necessary. There is no automatic
+  full-stack restart. Two observations are required for destructive recovery,
+  with buffering grace and at most three repairs per ten minutes. The budget
+  survives supervisor restarts. An unavailable host audio server causes a wait.
+- If PipeWire moves the identified Soloist stream to the desktop sink, the
+  supervisor moves only that stream back to the private bridge sink. It checks
+  this even while Spotify is paused, requires two observations, and limits
+  route moves separately to three per ten minutes. It does not restart Spotify
+  or change either output volume. An absent private sink or ambiguous stream
+  identity is reported, not guessed at.
+- The supervisor checks the *actual* source of the tagged PCM capture stream,
+  not just its requested `target.object`. If a game/display transition moves it
+  to the PC speaker monitor, it moves that one stream back to the private bridge
+  monitor before allowing playback reconciliation; `doctor.py` also fails on
+  this mismatch. It likewise restores an unambiguously identified Shairport
+  stream to the configured PC sink after a device transition. These checks run
+  while Spotify is idle, so they can repair the topology before playback resumes.
+  They never change the system default sink or another application's stream.
+- The supervisor identifies the separate Flatpak Spotify desktop stream through
+  its PipeWire client identity. While the bridge is active it temporarily mutes
+  that stream, restoring only a mute it applied itself when the conflict ends.
+  The mute claim survives a recreated desktop stream, since PipeWire can carry
+  the previous mute into a new stream ID.
+  It also releases its owned mute if Soloist stops during a source-route fault;
+  a routing fault must not strand direct PC playback. The health audit warns
+  when the desktop app remains muted while bridge playback is idle.
+  If the PC sink disappears and PipeWire moves the desktop stream onto the
+  private capture sink, it moves the exact stream back when the PC sink returns;
+  until then the stream stays muted to prevent it feeding the bridge. Other
+  desktop applications are not muted or moved.
+- A muted or still-corked local Shairport receiver is reported as degraded
+  during active playback, never counted as verified PC playback based on
+  another application's audio. The supervisor
+  leaves a receiver mute in place because it may be an intentional safety stop;
+  it does not trigger a container restart loop to try to clear it.
+- If the configured physical PC sink is missing, active playback waits instead
+  of connecting the local AirPlay path to a fallback or restarting Shairport.
+  A powered-off DisplayPort monitor can cause this condition; restoring the
+  device is a host-side prerequisite, not a bridge-container repair.
+- Spotify is restarted only for a source-container fault or stale source audio
+  socket mounts. A host audio-server reset can still lose the Spotify session;
+  this is recorded as a source interruption, never described as seamless recovery.
+- Idle playback disconnects the pair after 60 seconds and never injects a tone
+  by default. After five seconds without an active Soloist source, it first
+  pauses OwnTone's managed PCM pipe so the local AirPlay receiver cannot keep
+  playing a stale buffer during the disconnect grace period. Active playback
+  reconnects and resumes the pipe only after topology/source guards;
+  another reported WiiM source is not automatically replaced.
+- Desired `auto`, `local`, and `stopped` modes are stored atomically in the
+  ignored cache. Manual intent survives restart/reboot, independent of OwnTone's
+  transient connection flags. Reconnects restore configured levels/offsets.
+- Read-only `doctor.py` checks the supervisor heartbeat and actual reported
+  state, not just container liveness. Private status and bounded event history
+  live in `runtime/supervisor-status.json` and `runtime/supervisor-events.log`.
 
-## Optional idle speaker keepalive
+### Distinguishing PC-only audio faults
+
+The Spotify desktop app and the `PC + WiiM` Spotify Connect device are separate
+players. The desktop app normally plays directly to the PC, but PipeWire may
+move it to the private bridge sink when the physical PC sink disappears. That
+can feed unintended audio into the bridge. `soloist ctl now` can report
+`status=playing` while `is_active=false`.
+Check both fields and the actual sink-input route before restarting anything.
+Likewise, a nonzero PC sink monitor proves digital samples reached PipeWire,
+not that the DisplayPort speakers are audible or that the samples are fresh.
+If only the PC loops while WiiM plays normally, inspect the local OwnTone to
+Shairport session. If the PC still makes sound after that output is deselected
+and Shairport is corked, inspect other PC sink inputs, including the separate
+Spotify desktop app. The supervisor does not mute other desktop applications
+and cannot prove that digitally present PC audio is fresh rather than looping.
+
+If Spotify fails to resume after exiting a game, run `python3 doctor.py` from
+this project. Games and display mode changes can temporarily remove a PipeWire
+sink; the supervisor waits for the configured PC sink to return and then
+reconciles only bridge-owned capture, receiver, and Soloist routes. It does not
+override a headset or other desktop default chosen for the game. An active
+Spotify Connect session and audible PC/WiiM output are still separate checks.
+
+### Failure testing and acceptance
+
+`tests/test_supervisor.py` tests decision sequences and a real loopback HTTP
+OwnTone simulator. This does **not** substitute for testing the installation.
+Live tests deliberately interrupt one bridge component, verify its automatic
+recovery, and assert that the Soloist process identity did not change:
+
+```bash
+python3 scripts/verify-recovery.py --fault capture --confirm-interruption
+python3 scripts/verify-recovery.py --fault owntone --confirm-interruption
+python3 scripts/verify-recovery.py --fault shairport --confirm-interruption
+python3 scripts/verify-recovery.py --fault volume --confirm-interruption
+python3 scripts/verify-recovery.py --fault supervisor --confirm-interruption
+# Require Spotify actively playing to the bridge:
+python3 scripts/verify-recovery.py --fault outputs --confirm-interruption
+python3 scripts/verify-recovery.py --fault player --confirm-interruption
+```
+
+Evidence is appended to ignored `runtime/recovery-verification.jsonl`, including
+whether Spotify was actively playing. Idle-only passes do not establish music
+continuity. Run a listening/idle soak, audio-server restart, and an explicitly
+coordinated host reboot before calling an installation stable. The test helper
+never reboots the host or changes its network settings.
+
+## Optional idle speaker keepalive (not recommended for auto-standby speakers)
 
 Some powered speakers enter standby when their analog input has no signal.
 An open AirPlay session carrying digital silence does not necessarily prevent
 that. The optional keepalive mixes a short non-silent tone into the private
 bridge sink, independently of Spotify's volume. It is an experimental workaround,
 not a confirmed fix for periodic speaker chimes or a command to power speakers on.
+For speakers that beep when they wake and then time out, leave this disabled:
+short periodic bursts can cause exactly that wake/sleep cycle. The normal bridge
+now disconnects AirPlay while Spotify is idle instead.
+Setting `KEEPALIVE_ENABLED=1` opts back into always-connected AirPlay and
+disables the automatic idle disconnect; turn it on only if you intentionally
+want to trial the keepalive service.
 
 Set these values in the private `.env` to enable a trial:
 
@@ -286,7 +403,7 @@ the Python tests, syntax, Compose model, shell scripts, and credential scan.
 
 ## Recovery on a replacement machine
 
-1. Install the prerequisites and clone the private repository.
+1. Install the prerequisites and clone the repository.
 2. Restore `.env` from a secure backup or recreate it from `.env.example`.
 3. Generate a fresh Soloist key and run `./save-soloist-key.sh`.
 4. Run `./ensure-runtime.sh` and

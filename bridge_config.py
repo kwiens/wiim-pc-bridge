@@ -42,6 +42,7 @@ KNOWN_KEYS = frozenset(
         "LOCAL_OUTPUT_NAME",
         "LOCAL_VOLUME",
         "PULSE_COOKIE_PATH",
+        "SHAIRPORT_INTERFACE",
         "SOLOIST_KEY_FILE",
         "START_BUFFER_MS",
         "TRUSTED_NETWORK",
@@ -155,6 +156,7 @@ class BridgeConfig:
     runtime_dir: Path
     soloist_key_file: Path
     pulse_cookie_path: Path
+    shairport_interface: str
     displayport_sink: str
     bridge_sink: str
     friendly_name: str
@@ -188,7 +190,9 @@ class BridgeConfig:
         return tuple(ip for ip, _name in self.followers)
 
 
-def _parse_followers(raw: str, default_ip: str, default_name: str) -> tuple:
+def _parse_followers(
+    raw: str, default_ip: str, default_name: str
+) -> tuple[tuple[str, str], ...]:
     if not raw.strip():
         return ((default_ip, default_name),)
     followers: list[tuple[str, str]] = []
@@ -274,6 +278,7 @@ def load_config() -> BridgeConfig:
                 str(Path.home() / ".config/pulse/cookie"),
             )
         ),
+        shairport_interface=_value(values, "SHAIRPORT_INTERFACE", ""),
         displayport_sink=_value(values, "DISPLAYPORT_SINK", ""),
         bridge_sink=_value(values, "BRIDGE_SINK", "wiim_bridge"),
         friendly_name=_value(values, "BRIDGE_FRIENDLY_NAME", "PC + WiiM"),
@@ -320,15 +325,24 @@ def load_config() -> BridgeConfig:
     ):
         if not path.is_absolute():
             raise ConfigError(f"{name} must be an absolute path")
-    # A key inside the clone is one `git add -A` away from being published.
-    if PROJECT in config.soloist_key_file.parents:
-        raise ConfigError(
-            "SOLOIST_KEY_FILE must live outside the repository so it cannot be "
-            "committed; use a path such as ~/.config/wiim-pc-bridge/soloist_api_key"
-        )
+        if not str(path).isprintable():
+            raise ConfigError(f"{name} must not contain control characters")
+    # Either credential inside the clone is one `git add -A` away from being
+    # published. Resolve traversal and existing symlinks before containment is
+    # tested so `/clone/../clone/secret` cannot bypass this boundary.
+    for name, path in (
+        ("SOLOIST_KEY_FILE", config.soloist_key_file),
+        ("PULSE_COOKIE_PATH", config.pulse_cookie_path),
+    ):
+        resolved = path.resolve(strict=False)
+        if resolved == PROJECT or PROJECT in resolved.parents:
+            raise ConfigError(
+                f"{name} must live outside the repository so it cannot be committed"
+            )
     for name, value in (
         ("DISPLAYPORT_SINK", config.displayport_sink),
         ("BRIDGE_SINK", config.bridge_sink),
+        ("SHAIRPORT_INTERFACE", config.shairport_interface),
         ("BRIDGE_FRIENDLY_NAME", config.friendly_name),
         ("KITCHEN_DEVICE_NAME", config.kitchen_device_name),
         ("LIVING_ROOM_DEVICE_NAME", config.living_room_device_name),
@@ -337,16 +351,25 @@ def load_config() -> BridgeConfig:
     ):
         if not value:
             raise ConfigError(f"{name} must not be empty")
+        if not value.isprintable():
+            raise ConfigError(f"{name} must not contain control characters")
     for name, value in (
         ("DISPLAYPORT_SINK", config.displayport_sink),
         ("BRIDGE_SINK", config.bridge_sink),
+        ("SHAIRPORT_INTERFACE", config.shairport_interface),
     ):
         if any(character.isspace() for character in value):
             raise ConfigError(f"{name} must not contain whitespace")
+    if config.displayport_sink == config.bridge_sink:
+        raise ConfigError("DISPLAYPORT_SINK and BRIDGE_SINK must be different")
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,15}", config.shairport_interface):
+        raise ConfigError("SHAIRPORT_INTERFACE must be a Linux network interface name")
     network = _validate_trusted_network(config.trusted_network)
     leader = _validate_device_address("KITCHEN_IP", config.kitchen_ip, network)
     seen = {leader}
     for ip, follower_name in config.followers:
+        if not follower_name.isprintable():
+            raise ConfigError("WiiM follower names must not contain control characters")
         address = _validate_device_address(f"follower {follower_name}", ip, network)
         if address in seen:
             raise ConfigError(f"duplicate WiiM address {ip}")

@@ -37,7 +37,7 @@ cleanup() {
       (
         cd "$project_directory" || exit 1
         docker compose up -d --no-deps --force-recreate \
-          --wait --wait-timeout 180 soloist
+          --wait --wait-timeout 180 soloist capture
       ) || echo "Automatic container rollback failed; run" \
         "'docker compose up -d --build soloist'." >&2
     fi
@@ -52,7 +52,7 @@ trap 'exit 143' TERM
 
 current_sha=$(sed -nE 's/^ARG SOLOIST_ARCHIVE_SHA256=([0-9a-f]{64})$/\1/p' \
   "$project_directory/Dockerfile.soloist")
-current_tag=$(sed -nE 's#^    image: wiim-pc-bridge/soloist:(.+)$#\1#p' \
+current_tag=$(sed -nE 's#^    image: (&soloist_image )?wiim-pc-bridge/soloist:(.+)$#\2#p' \
   "$project_directory/compose.yaml")
 if [ -z "$current_sha" ] || [ -z "$current_tag" ]; then
   echo "Could not read the current Soloist pins; no files were changed." >&2
@@ -121,9 +121,9 @@ if [ "$candidate_tag" = "$current_tag" ]; then
 fi
 
 sed -i -E \
-  "s#^    image: wiim-pc-bridge/soloist:.*#    image: wiim-pc-bridge/soloist:$candidate_tag#" \
+  "s#^    image: (&soloist_image )?wiim-pc-bridge/soloist:.*#    image: \&soloist_image wiim-pc-bridge/soloist:$candidate_tag#" \
   "$project_directory/compose.yaml"
-updated_tag=$(sed -nE 's#^    image: wiim-pc-bridge/soloist:(.+)$#\1#p' \
+updated_tag=$(sed -nE 's#^    image: (&soloist_image )?wiim-pc-bridge/soloist:(.+)$#\2#p' \
   "$project_directory/compose.yaml")
 if [ "$updated_tag" != "$candidate_tag" ]; then
   echo "Could not update the Soloist image tag." >&2
@@ -132,7 +132,7 @@ fi
 
 docker tag "$candidate_image" "wiim-pc-bridge/soloist:$candidate_tag"
 container_changed=1
-docker compose up -d --no-deps --force-recreate soloist
+docker compose up -d --no-deps --force-recreate soloist capture
 
 attempt=0
 until [ "$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' \
