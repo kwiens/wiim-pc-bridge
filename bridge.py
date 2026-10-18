@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 import http.client
 import json
+import logging
+import os
 import ssl
 import sys
 import time
@@ -27,6 +29,7 @@ WIIM_TYPE = "AirPlay 2"
 TIMEOUT_SECONDS = 5
 PLAYER_RESUME_SETTLE_SECONDS = 3.0
 PLAYER_RESUME_POLL_SECONDS = 0.25
+PCM_PIPE_PATH = "/srv/media/spotify.pcm"
 
 # Errors raised while reading a response body are not wrapped into URLError by
 # urllib, so they have to be named explicitly or they escape as tracebacks.
@@ -54,6 +57,8 @@ def target_output(target: str) -> tuple[str, str]:
 def request(
     path: str, method: str = "GET", payload: object | None = None
 ) -> object | None:
+    if path == "/player/pause" and method == "PUT":
+        logging.warning("OwnTone PCM pause requested by local process %d", os.getpid())
     data = None
     headers: dict[str, str] = {}
     if payload is not None:
@@ -423,6 +428,45 @@ def resume_pcm_playback() -> bool:
     if not isinstance(queue, dict) or not isinstance(queue.get("items"), list):
         raise BridgeError("OwnTone returned an unknown playback queue")
     items = queue["items"]
+    if not items:
+        # OwnTone may lose its queue on restart or before its pipe watcher
+        # repopulates it. Install only our exact item; never replace a queue.
+        lookup = request("/search?type=tracks&query=spotify.pcm")
+        tracks = lookup.get("tracks") if isinstance(lookup, dict) else None
+        candidates = tracks.get("items") if isinstance(tracks, dict) else None
+        if not isinstance(candidates, list):
+            raise BridgeError("OwnTone returned an unknown bridge PCM library search")
+        matches = [
+            item
+            for item in candidates
+            if isinstance(item, dict)
+            and item.get("data_kind") == "pipe"
+            and item.get("path") == PCM_PIPE_PATH
+            and item.get("uri") == f"library:track:{item.get('id')}"
+        ]
+        if len(matches) != 1:
+            raise BridgeError("bridge PCM pipe is missing or ambiguous in OwnTone")
+        uri = urllib.parse.quote(matches[0]["uri"], safe=":")
+        request(f"/queue/items/add?uris={uri}&playback=start", method="POST")
+        queue = request("/queue")
+        if not isinstance(queue, dict) or not isinstance(queue.get("items"), list):
+            raise BridgeError("OwnTone returned an unknown playback queue")
+        items = queue["items"]
+        if (
+            len(items) != 1
+            or not isinstance(items[0], dict)
+            or items[0].get("data_kind") != "pipe"
+            or items[0].get("path") != PCM_PIPE_PATH
+        ):
+            raise BridgeError("OwnTone did not install only the bridge PCM pipe")
+        deadline = time.monotonic() + PLAYER_RESUME_SETTLE_SECONDS
+        while True:
+            refreshed = request("/player")
+            if isinstance(refreshed, dict) and refreshed.get("state") == "play":
+                return True
+            if time.monotonic() >= deadline:
+                raise BridgeError("OwnTone PCM player did not start")
+            time.sleep(min(PLAYER_RESUME_POLL_SECONDS, deadline - time.monotonic()))
     current_id = player.get("item_id")
     current = [
         item
@@ -436,7 +480,7 @@ def resume_pcm_playback() -> bool:
     if (
         len(current) != 1
         or current[0].get("data_kind") != "pipe"
-        or current[0].get("path") != "/srv/media/spotify.pcm"
+        or current[0].get("path") != PCM_PIPE_PATH
     ):
         raise BridgeError(
             "refusing to resume an OwnTone queue other than the bridge PCM pipe"
@@ -474,7 +518,7 @@ def pause_pcm_playback() -> bool:
     if (
         len(current) != 1
         or current[0].get("data_kind") != "pipe"
-        or current[0].get("path") != "/srv/media/spotify.pcm"
+        or current[0].get("path") != PCM_PIPE_PATH
     ):
         raise BridgeError(
             "refusing to pause an OwnTone queue other than the bridge PCM pipe"

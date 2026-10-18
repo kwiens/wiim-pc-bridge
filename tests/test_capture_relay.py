@@ -73,12 +73,20 @@ class CaptureRelayTests(unittest.TestCase):
                 ]
                 for block in blocks:
                     pcm.append(block)
-                self.assertEqual(capture_relay.flush_fifo(fifo, pcm, writer), writer)
-                self.assertGreater(pcm.bytes, 0)
+                # FIFO capacity varies by kernel and host limits. Simulate
+                # backpressure instead of assuming 32 KiB fills the pipe.
+                with mock.patch(
+                    "capture_relay.os.write",
+                    side_effect=BlockingIOError(errno.EAGAIN, "FIFO full"),
+                ):
+                    self.assertEqual(
+                        capture_relay.flush_fifo(fifo, pcm, writer), writer
+                    )
+                self.assertEqual(pcm.bytes, len(blocks) * capture_relay.BLOCK_SIZE)
                 received = bytearray()
                 while pcm.blocks:
-                    received.extend(os.read(reader, 8192))
                     capture_relay.flush_fifo(fifo, pcm, writer)
+                    received.extend(os.read(reader, 8192))
                 while True:
                     try:
                         piece = os.read(reader, 8192)

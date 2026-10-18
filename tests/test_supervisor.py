@@ -284,6 +284,34 @@ class SupervisorSequenceTests(unittest.TestCase):
         self.assertEqual(self.monitor.verified_samples, 0)
         self.assertEqual(self.monitor.state, "unverified")
 
+    def test_paused_pcm_uses_fast_separate_targeted_recovery(self):
+        self.runtime.result = supervisor.Finding("pcm_paused", "player paused")
+        self.monitor.tick(0)
+        self.assertEqual(self.monitor.state, "degraded")
+        self.assertEqual(self.monitor.next_probe, supervisor.PCM_RESUME_PROBE_SECONDS)
+        self.monitor.tick(5)
+        self.assertEqual(len(self.runtime.actions), 1)
+        self.assertEqual(self.runtime.actions[0][0].kind, "pcm_paused")
+        self.assertEqual(self.monitor.pcm_resumes, 1)
+        self.assertEqual(self.monitor.repair_times, [])
+        self.assertEqual(self.monitor.settle_until, 15)
+        self.runtime.result = supervisor.Finding("verified", "PC PCM verified")
+        self.monitor.tick(15)
+        self.assertEqual(self.monitor.state, "playing")
+
+    def test_pcm_resume_has_its_own_bounded_budget(self):
+        finding = supervisor.Finding("pcm_paused", "player paused")
+        for attempt in range(supervisor.PCM_RESUME_LIMIT):
+            now = attempt * 20
+            self.monitor.fault(finding, now)
+            self.monitor.fault(finding, now + 5)
+        self.assertEqual(len(self.runtime.actions), supervisor.PCM_RESUME_LIMIT)
+        self.assertEqual(self.monitor.repair_times, [])
+        self.monitor.fault(finding, 200)
+        self.monitor.fault(finding, 205)
+        self.assertEqual(len(self.runtime.actions), supervisor.PCM_RESUME_LIMIT)
+        self.assertIn("budget exhausted", self.monitor.detail)
+
     def test_stopped_intent_survives_supervisor_restart(self):
         output_control.set_mode("stopped")
         self.monitor.tick(0)
@@ -645,6 +673,7 @@ class SupervisorSequenceTests(unittest.TestCase):
             "updated_at": 995,
             "repairs": 8,
             "route_repairs": 2,
+            "pcm_resumes": 3,
             "source_interruptions": 1,
             "verified_samples": 100,
             "playback_sessions": 2,
@@ -652,6 +681,7 @@ class SupervisorSequenceTests(unittest.TestCase):
             "was_playing": True,
             "repair_timestamps": [300, 850, 900, 980],
             "route_repair_timestamps": [900, 980],
+            "pcm_resume_timestamps": [900, 980],
         }
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "status.json"
@@ -666,6 +696,8 @@ class SupervisorSequenceTests(unittest.TestCase):
         self.assertEqual(restarted.repairs, 8)
         self.assertEqual(restarted.route_repairs, 2)
         self.assertEqual(restarted.route_repair_times, [100, 180])
+        self.assertEqual(restarted.pcm_resume_times, [100, 180])
+        self.assertEqual(restarted.pcm_resumes, 3)
         self.assertEqual(restarted.source_interruptions, 1)
         self.assertEqual(restarted.verified_samples, 100)
         restarted.tick(205)
@@ -889,12 +921,13 @@ class HttpFailureSequenceTests(unittest.TestCase):
         self.server.player = "pause"
         self.assertTrue(self.runtime.reconcile(True, 10, "auto"))
         self.assertEqual(self.server.player, "play")
-        self.runtime.reconcile(False, 20, "auto")
-        self.runtime.reconcile(False, 81, "auto")
-        self.assertFalse(any(item["selected"] for item in self.server.items))
-        writes = len(self.server.writes)
-        for now in range(100, 1300, 60):
-            self.runtime.reconcile(False, now, "auto")
+        with mock.patch.object(self.runtime, "source_pcm_active", return_value=False):
+            self.runtime.reconcile(False, 20, "auto")
+            self.runtime.reconcile(False, 81, "auto")
+            self.assertFalse(any(item["selected"] for item in self.server.items))
+            writes = len(self.server.writes)
+            for now in range(100, 1300, 60):
+                self.runtime.reconcile(False, now, "auto")
         self.assertEqual(len(self.server.writes), writes)
         self.assertTrue(self.runtime.reconcile(True, 1400, "auto"))
         bridge.stop()
@@ -902,6 +935,15 @@ class HttpFailureSequenceTests(unittest.TestCase):
         self.assertFalse(any(item["selected"] for item in self.server.items))
         bridge.select_all(confirmed=True)
         self.assertEqual(output_control.mode(), "auto")
+
+    def test_live_source_pcm_blocks_false_idle_pause_over_real_http(self):
+        self.assertTrue(self.runtime.reconcile(True, 0, "auto"))
+        with mock.patch.object(self.runtime, "source_pcm_active", return_value=True):
+            self.runtime.reconcile(False, 20, "auto")
+            self.runtime.reconcile(False, 81, "auto")
+        self.assertEqual(self.server.player, "play")
+        self.assertTrue(all(item["selected"] for item in self.server.items))
+        self.assertNotIn(("/api/player/pause", None), self.server.writes)
 
     def test_guarded_wiim_source_keeps_pc_playing_without_takeover(self):
         with mock.patch(

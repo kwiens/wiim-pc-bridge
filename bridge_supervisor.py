@@ -27,6 +27,9 @@ PERIOD = 5.0
 PROBE_PERIOD = 15.0
 SETTLE_SECONDS = 20.0
 ROUTE_REPAIR_LIMIT = 3
+PCM_RESUME_LIMIT = 6
+PCM_RESUME_PROBE_SECONDS = 5.0
+PCM_RESUME_SETTLE_SECONDS = 10.0
 ERRORS = (OSError, RuntimeError, ValueError, subprocess.SubprocessError)
 stopping = False
 
@@ -165,6 +168,11 @@ class Runtime:
 
     def playing(self) -> bool:
         return flow.soloist_has_active_playback()
+
+    @staticmethod
+    def source_pcm_active() -> bool:
+        source = get_config().bridge_sink + ".monitor"
+        return flow.sample_peaks((source,))[source] >= flow.ACTIVE_PEAK
 
     @staticmethod
     def pc_sink_available() -> bool:
@@ -467,7 +475,9 @@ class Runtime:
                     and get_config().wiim_source_priority == "guarded"
                 ):
                     self.source_guard()
-                return self.outputs.observe(playing, now)
+                return self.outputs.observe(
+                    playing, now, source_pcm_active=self.source_pcm_active
+                )
             except ERRORS:
                 if playing:
                     self.fallback_pc_after_wiim_error()
@@ -703,8 +713,10 @@ class Supervisor:
     stage: int = 0
     repair_times: list[float] = field(default_factory=list)
     route_repair_times: list[float] = field(default_factory=list)
+    pcm_resume_times: list[float] = field(default_factory=list)
     repairs: int = 0
     route_repairs: int = 0
+    pcm_resumes: int = 0
     source_interruptions: int = 0
     source_identity: str | None = None
     muted_desktop_stream: int | None = None
@@ -725,6 +737,7 @@ class Supervisor:
             for key in (
                 "repairs",
                 "route_repairs",
+                "pcm_resumes",
                 "source_interruptions",
                 "verified_samples",
                 "playback_sessions",
@@ -748,6 +761,11 @@ class Supervisor:
             self.route_repair_times = [
                 now - (wall - float(stamp))
                 for stamp in data.get("route_repair_timestamps", [])
+                if 0 <= wall - float(stamp) < 600
+            ]
+            self.pcm_resume_times = [
+                now - (wall - float(stamp))
+                for stamp in data.get("pcm_resume_timestamps", [])
                 if 0 <= wall - float(stamp) < 600
             ]
             if self.repair_times:
@@ -851,14 +869,22 @@ class Supervisor:
             "capture_misrouted",
             "receiver_misrouted",
         )
+        is_pcm = finding.kind == "pcm_paused"
         # A misrouted capture can immediately create an audio feedback loop.
         # The repair rechecks exact identity, so do not wait for a second tick.
         required = 1 if finding.kind == "capture_misrouted" else 2
         if self.consecutive < required or (now < self.settle_until and not is_route):
             return
-        budget = self.route_repair_times if is_route else self.repair_times
+        budget = (
+            self.route_repair_times
+            if is_route
+            else self.pcm_resume_times
+            if is_pcm
+            else self.repair_times
+        )
         budget[:] = [attempt for attempt in budget if now - attempt < 600]
-        if len(budget) >= ROUTE_REPAIR_LIMIT:
+        limit = PCM_RESUME_LIMIT if is_pcm else ROUTE_REPAIR_LIMIT
+        if len(budget) >= limit:
             self.transition(
                 "degraded",
                 finding.detail
@@ -869,14 +895,24 @@ class Supervisor:
         self.repairs += 1
         if is_route:
             self.route_repairs += 1
+        if is_pcm:
+            self.pcm_resumes += 1
         self.transition("recovering", finding.detail)
         self.persist(now)
         try:
             self.last_action = self.runtime.repair(finding, self.stage)
         finally:
-            self.stage = 0 if is_route else self.stage + 1
+            self.stage = 0 if is_route or is_pcm else self.stage + 1
             self.consecutive = 0
-            self.settle_until = now + (SETTLE_SECONDS if is_route else 60)
+            self.settle_until = now + (
+                PCM_RESUME_SETTLE_SECONDS
+                if is_pcm
+                else SETTLE_SECONDS
+                if is_route
+                else 60
+            )
+            if is_pcm:
+                self.next_probe = self.settle_until
             self.next_infrastructure = 0
         self.transition("recovering", self.last_action)
 
@@ -953,6 +989,8 @@ class Supervisor:
             self.transition(finding.kind, finding.detail)
         else:
             self.fault(finding, now)
+            if finding.kind == "pcm_paused" and self.state == "degraded":
+                self.next_probe = now + PCM_RESUME_PROBE_SECONDS
 
     def persist(self, now: float) -> None:
         write_status(
@@ -966,6 +1004,7 @@ class Supervisor:
                 "last_action": self.last_action,
                 "repairs": self.repairs,
                 "route_repairs": self.route_repairs,
+                "pcm_resumes": self.pcm_resumes,
                 "source_interruptions": self.source_interruptions,
                 "source_identity": self.source_identity,
                 "muted_desktop_stream": self.muted_desktop_stream,
@@ -978,6 +1017,9 @@ class Supervisor:
                 ],
                 "route_repair_timestamps": [
                     time.time() - (now - stamp) for stamp in self.route_repair_times
+                ],
+                "pcm_resume_timestamps": [
+                    time.time() - (now - stamp) for stamp in self.pcm_resume_times
                 ],
             }
         )

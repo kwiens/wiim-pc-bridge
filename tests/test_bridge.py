@@ -252,6 +252,63 @@ class OutputTests(unittest.TestCase):
 
 
 class PlayerRecoveryTests(unittest.TestCase):
+    def test_empty_queue_adds_only_exact_bridge_pipe_and_starts_it(self) -> None:
+        pipe = {
+            "id": 42,
+            "data_kind": "pipe",
+            "path": bridge.PCM_PIPE_PATH,
+            "uri": "library:track:42",
+        }
+        with mock.patch.object(
+            bridge,
+            "request",
+            side_effect=[
+                {"state": "stop", "item_id": 0},
+                {"items": []},
+                {"tracks": {"items": [pipe]}},
+                {"items": [pipe]},
+                {"items": [pipe]},
+                {"state": "play", "item_id": 101},
+            ],
+        ) as request:
+            self.assertTrue(bridge.resume_pcm_playback())
+        self.assertEqual(
+            request.call_args_list,
+            [
+                mock.call("/player"),
+                mock.call("/queue"),
+                mock.call("/search?type=tracks&query=spotify.pcm"),
+                mock.call(
+                    "/queue/items/add?uris=library:track:42&playback=start",
+                    method="POST",
+                ),
+                mock.call("/queue"),
+                mock.call("/player"),
+            ],
+        )
+
+    def test_empty_queue_does_not_add_ambiguous_or_wrong_pipe(self) -> None:
+        wrong = {
+            "id": 42,
+            "data_kind": "pipe",
+            "path": "/srv/media/other.pcm",
+            "uri": "library:track:42",
+        }
+        with (
+            mock.patch.object(
+                bridge,
+                "request",
+                side_effect=[
+                    {"state": "stop", "item_id": 0},
+                    {"items": []},
+                    {"tracks": {"items": [wrong]}},
+                ],
+            ) as request,
+            self.assertRaisesRegex(bridge.BridgeError, "missing or ambiguous"),
+        ):
+            bridge.resume_pcm_playback()
+        self.assertEqual(request.call_count, 3)
+
     def test_running_player_is_left_alone(self) -> None:
         with mock.patch.object(
             bridge, "request", return_value={"state": "play"}

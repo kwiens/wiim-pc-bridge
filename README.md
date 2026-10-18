@@ -228,12 +228,17 @@ credential can be committed by a stray `git add -A`.
 - Recovery is scoped: reconnect outputs/resume the pipe, restart a failed
   receiver, then recover OwnTone/capture if necessary. There is no automatic
   full-stack restart. Two observations are required for destructive recovery,
-  with buffering grace and at most three repairs per ten minutes. The budget
-  survives supervisor restarts. An unavailable host audio server causes a wait.
+  with buffering grace and at most three such repairs per ten minutes. Safe
+  queue-validated PCM resumes have a separate six-per-ten-minute budget and
+  a shorter confirmation/settling cycle. Budgets survive supervisor restarts.
+  An unavailable host audio server causes a wait.
 - During active playback, WiiM reconnection keeps the already-selected PC
   output in place and restores the WiiM's configured level before joining it.
   A quiet Spotify source does not trigger WiiM transport recycling; a paused
-  PCM player with active source samples gets a targeted, budgeted resume.
+  PCM player with active source samples gets a targeted, budgeted resume. If
+  OwnTone restarts with an empty queue, only the exact bridge PCM pipe may be
+  installed; an unrelated queue is never replaced. Before an idle pause or
+  output release, live source PCM vetoes a transient false-idle report.
 - If PipeWire moves the identified Soloist stream to the desktop sink, the
   supervisor moves only that stream back to the private bridge sink. It checks
   this even while Spotify is paused, requires two observations, and limits

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import selectors
 import signal
@@ -11,6 +12,7 @@ import subprocess  # nosec B404
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,7 +41,7 @@ FLOW_CHECK_SECONDS = 5
 FLOW_FAILURE_LIMIT = 2
 PLAYBACK_POLL_INTERVAL = 5.0
 IDLE_DISCONNECT_SECONDS = 60.0
-IDLE_PIPE_PAUSE_SECONDS = 5.0
+IDLE_PIPE_PAUSE_SECONDS = 15.0
 RECEIVER_RECONNECT_SECONDS = 30
 RECEIVER_ADVERTISEMENT_SECONDS = 5
 MAX_TRACE_LINE_BYTES = 1024 * 1024
@@ -175,7 +177,12 @@ class IdleOutputController:
         print("Spotify is idle; released the PC and WiiM AirPlay outputs.", flush=True)
         return True
 
-    def observe(self, playing: bool, now: float) -> bool:
+    def observe(
+        self,
+        playing: bool,
+        now: float,
+        source_pcm_active: Callable[[], bool] | None = None,
+    ) -> bool:
         if playing:
             resume_needed = self.pipe_paused or self.released
             self.idle_since = None
@@ -227,9 +234,28 @@ class IdleOutputController:
             return False
         if self.idle_since is None:
             self.idle_since = now
+        elapsed = now - self.idle_since
+        # A transient/misreported Soloist idle state must never silence an
+        # active local source. PCM presence is only a veto here, not proof
+        # that the downstream speakers are audible.
+        if (
+            elapsed >= IDLE_PIPE_PAUSE_SECONDS
+            and source_pcm_active is not None
+            and source_pcm_active()
+        ):
+            logging.warning(
+                "Soloist reported idle while source PCM remained active; "
+                "retaining bridge playback"
+            )
+            self.idle_since = None
+            return False
         if not self.pipe_paused and now - self.idle_since >= IDLE_PIPE_PAUSE_SECONDS:
             with output_control.locked():
                 if output_control.automatic_enabled():
+                    logging.info(
+                        "Attempting bridge PCM pause after %.1f seconds of observed idle",
+                        elapsed,
+                    )
                     bridge.pause_pcm_playback()
                     self.pipe_paused = True
         if now - self.idle_since >= IDLE_DISCONNECT_SECONDS:

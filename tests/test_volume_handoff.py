@@ -147,10 +147,24 @@ class VolumeHandoffTests(unittest.TestCase):
             controller.observe(False, 0.0)
             controller.observe(False, 4.0)
             pause.assert_not_called()
-            controller.observe(False, 5.0)
-            controller.observe(False, 10.0)
+            controller.observe(False, 15.0)
+            controller.observe(False, 20.0)
         pause.assert_called_once_with()
         select.assert_not_called()
+
+    def test_active_source_pcm_vetoes_idle_pause_and_release(self) -> None:
+        controller = volume_handoff.IdleOutputController()
+        with (
+            mock.patch("bridge.pause_pcm_playback") as pause,
+            mock.patch("bridge.set_outputs") as select,
+        ):
+            controller.observe(False, 0.0, lambda: True)
+            controller.observe(False, 60.0, lambda: True)
+            controller.observe(False, 120.0, lambda: True)
+            controller.observe(False, 140.0, lambda: True)
+        pause.assert_not_called()
+        select.assert_not_called()
+        self.assertIsNone(controller.idle_since)
 
     def test_opt_in_keepalive_disables_idle_disconnect(self) -> None:
         controller = volume_handoff.IdleOutputController(enabled=False)
