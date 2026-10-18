@@ -24,6 +24,17 @@ class ConfigTests(unittest.TestCase):
         ):
             load_config()
 
+    def test_wiim_source_priority_defaults_guarded_and_accepts_pc(self) -> None:
+        with configured():
+            self.assertEqual(load_config().wiim_source_priority, "guarded")
+        with configured(WIIM_SOURCE_PRIORITY="pc"):
+            self.assertEqual(load_config().wiim_source_priority, "pc")
+        with (
+            configured(WIIM_SOURCE_PRIORITY="always"),
+            self.assertRaisesRegex(ConfigError, "WIIM_SOURCE_PRIORITY"),
+        ):
+            load_config()
+
     def test_offset_bounds_are_enforced(self) -> None:
         with (
             configured(WIIM_OFFSET_MS="-2001"),

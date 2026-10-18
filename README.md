@@ -162,6 +162,11 @@ Positive offsets delay that output; valid offsets are -2000 through 2000 ms.
 | `LOCAL_OUTPUT_NAME`, `WIIM_OUTPUT_NAME` | Exact OwnTone output identities |
 | `LOCAL_VOLUME`, `WIIM_VOLUME` | Levels restored by reconciliation |
 | `LOCAL_OFFSET_MS`, `WIIM_OFFSET_MS` | Per-output synchronization adjustments |
+| `WIIM_SOURCE_PRIORITY` | `guarded` (default) protects an unknown WiiM source; `pc` lets active bridge playback take precedence. The PC-only route is preserved if WiiM reconnection fails. |
+
+`WIIM_SOURCE_PRIORITY=pc` applies to an active Spotify Connect bridge session,
+regardless of which controller started it. It does not override an explicit
+local-only or stopped output mode, and it never changes WiiM group membership.
 
 `ensure-runtime.sh` renders `runtime/owntone.conf` from `owntone.conf.in` on
 every start, writing through the existing file so a running OwnTone container

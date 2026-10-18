@@ -637,6 +637,27 @@ class SupervisorSequenceTests(unittest.TestCase):
             runtime.repair(supervisor.Finding("wiim_disconnected", "stale"), 0)
         reconcile.assert_not_called()
 
+    def test_pc_priority_reconnect_skips_source_guard(self):
+        runtime = supervisor.Runtime()
+        with configured(WIIM_SOURCE_PRIORITY="pc"), mock.patch.object(
+            runtime, "playing", return_value=True
+        ), mock.patch.object(runtime, "source_guard") as guard, mock.patch(
+            "bridge.reconcile_once"
+        ) as reconcile, mock.patch("bridge.resume_pcm_playback") as resume:
+            runtime.repair(supervisor.Finding("wiim_disconnected", "stale"), 0)
+        guard.assert_not_called()
+        reconcile.assert_called_once()
+        resume.assert_called_once()
+
+    def test_pc_fallback_honors_explicit_stop(self):
+        runtime = supervisor.Runtime()
+        output_control.set_mode("stopped")
+        with mock.patch.object(
+            runtime, "pc_sink_available", return_value=True
+        ), mock.patch("bridge.outputs") as outputs:
+            self.assertFalse(runtime.ensure_pc_playback())
+        outputs.assert_not_called()
+
     def test_missing_capture_is_recreated_without_touching_source(self):
         runtime = supervisor.Runtime()
         names = "\n".join(
@@ -785,6 +806,9 @@ class HttpFailureSequenceTests(unittest.TestCase):
         self.server.reject_selection = True
         with self.assertRaises(bridge.BridgeError):
             self.runtime.reconcile(True, 0, "auto")
+        self.assertTrue(self.server.items[0]["selected"])
+        self.assertFalse(self.server.items[1]["selected"])
+        self.assertEqual(self.server.player, "play")
         self.assertTrue(self.runtime.reconcile(True, 5, "auto"))
         self.assertTrue(all(item["selected"] for item in self.server.items))
         self.assertEqual(self.server.player, "play")
@@ -806,9 +830,40 @@ class HttpFailureSequenceTests(unittest.TestCase):
         bridge.select_all(confirmed=True)
         self.assertEqual(output_control.mode(), "auto")
 
-    def test_other_wiim_source_is_not_taken_over(self):
+    def test_guarded_wiim_source_keeps_pc_playing_without_takeover(self):
         with mock.patch(
             "bridge.wiim_request", return_value={"status": "play", "mode": "31"}
         ), self.assertRaisesRegex(bridge.BridgeError, "another source"):
             self.runtime.reconcile(True, 0, "auto")
-        self.assertEqual(self.server.writes, [])
+        self.assertTrue(self.server.items[0]["selected"])
+        self.assertFalse(self.server.items[1]["selected"])
+        self.assertEqual(self.server.player, "play")
+
+    def test_pc_priority_takes_over_other_wiim_source_during_active_playback(self):
+        group_reply = wiim_responses()
+
+        def reply(ip, command):
+            if command == "getPlayerStatus":
+                return {"status": "play", "mode": "31"}
+            return group_reply(ip, command)
+
+        with configured(WIIM_SOURCE_PRIORITY="pc"), mock.patch(
+            "bridge.wiim_request", side_effect=reply
+        ):
+            self.assertTrue(self.runtime.reconcile(True, 0, "auto"))
+        self.assertTrue(all(item["selected"] for item in self.server.items))
+        self.assertEqual(self.server.player, "play")
+
+    def test_pc_priority_does_not_select_outputs_while_idle(self):
+        with configured(WIIM_SOURCE_PRIORITY="pc"):
+            self.assertFalse(self.runtime.reconcile(False, 0, "auto"))
+        self.assertFalse(any(item["selected"] for item in self.server.items))
+
+    def test_missing_wiim_output_still_connects_pc(self):
+        self.server.items.pop()
+        with configured(WIIM_SOURCE_PRIORITY="pc"), self.assertRaisesRegex(
+            bridge.BridgeError, "Test WiiM Group"
+        ):
+            self.runtime.reconcile(True, 0, "auto")
+        self.assertTrue(self.server.items[0]["selected"])
+        self.assertEqual(self.server.player, "play")

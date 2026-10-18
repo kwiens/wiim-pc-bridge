@@ -49,6 +49,7 @@ KNOWN_KEYS = frozenset(
         "WIIM_FOLLOWERS",
         "WIIM_OFFSET_MS",
         "WIIM_OUTPUT_NAME",
+        "WIIM_SOURCE_PRIORITY",
         "WIIM_VOLUME",
     }
 )
@@ -170,6 +171,7 @@ class BridgeConfig:
     followers: tuple[tuple[str, str], ...]
     local_volume: int
     wiim_volume: int
+    wiim_source_priority: str
     local_offset_ms: int
     wiim_offset_ms: int
     start_buffer_ms: int
@@ -298,6 +300,7 @@ def load_config() -> BridgeConfig:
         ),
         local_volume=_integer(values, "LOCAL_VOLUME", 100),
         wiim_volume=_integer(values, "WIIM_VOLUME", 50),
+        wiim_source_priority=_value(values, "WIIM_SOURCE_PRIORITY", "guarded"),
         local_offset_ms=_integer(values, "LOCAL_OFFSET_MS", 0),
         wiim_offset_ms=_integer(values, "WIIM_OFFSET_MS", 0),
         start_buffer_ms=_integer(values, "START_BUFFER_MS", 2250),
@@ -308,6 +311,8 @@ def load_config() -> BridgeConfig:
     )
     _bounded("LOCAL_VOLUME", config.local_volume, VOLUME_RANGE)
     _bounded("WIIM_VOLUME", config.wiim_volume, VOLUME_RANGE)
+    if config.wiim_source_priority not in ("guarded", "pc"):
+        raise ConfigError("WIIM_SOURCE_PRIORITY must be guarded or pc")
     _bounded("LOCAL_OFFSET_MS", config.local_offset_ms, OFFSET_RANGE_MS)
     _bounded("WIIM_OFFSET_MS", config.wiim_offset_ms, OFFSET_RANGE_MS)
     _bounded("START_BUFFER_MS", config.start_buffer_ms, START_BUFFER_RANGE_MS)

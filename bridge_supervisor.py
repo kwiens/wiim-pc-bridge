@@ -402,16 +402,76 @@ class Runtime:
                 "WiiM is using another source or its playback state is unknown; not taking it over"
             )
 
+    def ensure_pc_playback(self) -> bool:
+        """Keep the local route audible when WiiM selection cannot complete."""
+        with output_control.locked():
+            if not output_control.automatic_enabled() or not self.pc_sink_available():
+                return False
+            items = bridge.outputs()
+            local = bridge.resolve_target(items, "local")
+            local_id = bridge.output_id(local)
+            config = get_config()
+            wiim = [
+                item
+                for item in items
+                if item.get("name") == config.wiim_output_name
+                and item.get("type") == bridge.WIIM_TYPE
+            ]
+            if len(wiim) > 1:
+                raise bridge.BridgeError("WiiM output identity is ambiguous")
+            pair_ids = {local_id} | {bridge.output_id(item) for item in wiim}
+            selected_ids = {
+                bridge.output_id(item) for item in items if item.get("selected") is True
+            }
+            # A different output is an explicit selection, not a failed pair.
+            if not selected_ids.issubset(pair_ids):
+                return False
+            changed = selected_ids != {local_id}
+            if changed:
+                if local_id not in selected_ids:
+                    bridge.set_output_volume(local, config.local_volume)
+                    bridge.set_output_offset(local, config.local_offset_ms)
+                bridge.set_outputs([local])
+            refreshed = bridge.resolve_target(bridge.outputs(), "local")
+            if refreshed.get("selected") is not True:
+                raise bridge.BridgeError(
+                    "PC-only fallback did not select the local output"
+                )
+            if bridge.output_integer(refreshed, "volume") != config.local_volume:
+                bridge.set_output_volume(refreshed, config.local_volume)
+                changed = True
+            if bridge.output_integer(refreshed, "offset_ms") != config.local_offset_ms:
+                bridge.set_output_offset(refreshed, config.local_offset_ms)
+                changed = True
+            resumed = bridge.resume_pcm_playback()
+            return changed or resumed
+
+    def fallback_pc_after_wiim_error(self) -> None:
+        try:
+            if self.ensure_pc_playback():
+                logging.warning("WiiM connection failed; restored PC-only playback")
+        except ERRORS as exc:
+            logging.warning("PC-only fallback failed: %s", exc)
+
     def reconcile(self, playing: bool, now: float, mode: str) -> bool:
         if mode == "auto":
-            # A sleeping/unplugged DisplayPort device is a host condition, not
+            # A sleeping/unplugged PC audio device is a host condition, not
             # a failed receiver. Avoid connecting the local AirPlay path to a
             # fallback sink while the intended PC output is absent.
             if playing and not self.pc_sink_available():
                 return False
-            if playing and not flow.configured_outputs_selected():
-                self.source_guard()
-            return self.outputs.observe(playing, now)
+            try:
+                if (
+                    playing
+                    and not flow.configured_outputs_selected()
+                    and get_config().wiim_source_priority == "guarded"
+                ):
+                    self.source_guard()
+                return self.outputs.observe(playing, now)
+            except ERRORS:
+                if playing:
+                    self.fallback_pc_after_wiim_error()
+                raise
         if mode == "manual":
             return False
         with output_control.locked():
@@ -456,7 +516,8 @@ class Runtime:
         if mode == "auto":
             try:
                 bridge.validate_wiim_group()
-                self.source_guard()
+                if get_config().wiim_source_priority == "guarded":
+                    self.source_guard()
                 status = bridge.wiim_request(get_config().kitchen_ip, "getPlayerStatus")
                 if status.get("status") != "play" or str(status.get("mode")) != "1":
                     return Finding(
@@ -556,12 +617,19 @@ class Runtime:
                 raise RuntimeError("Soloist route remained outside the private sink")
             return "Moved Soloist stream back to the private bridge sink"
         if finding.kind == "wiim_disconnected":
-            with output_control.locked():
-                if not output_control.automatic_enabled() or not self.playing():
-                    return "Reconnection cancelled: playback or manual intent changed"
-                self.source_guard()
-                bridge.reconcile_once()
-                bridge.resume_pcm_playback()
+            try:
+                with output_control.locked():
+                    if not output_control.automatic_enabled() or not self.playing():
+                        return (
+                            "Reconnection cancelled: playback or manual intent changed"
+                        )
+                    if get_config().wiim_source_priority == "guarded":
+                        self.source_guard()
+                    bridge.reconcile_once()
+                    bridge.resume_pcm_playback()
+            except ERRORS:
+                self.fallback_pc_after_wiim_error()
+                raise
             return "Reconnected stale WiiM AirPlay session"
         if finding.kind in ("stale_mount", "container_missing"):
             services = finding.services
