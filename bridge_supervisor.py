@@ -507,6 +507,28 @@ class Runtime:
                 "Local receiver is muted; PC audio cannot be verified. "
                 "Leaving the mute in place because it may be an intentional safety stop",
             )
+        config = get_config()
+        source = config.bridge_sink + ".monitor"
+        target = config.displayport_sink + ".monitor"
+        peaks = flow.sample_peaks((source, target))
+        if not self.playing():
+            return Finding("idle", "Spotify stopped during the audio probe")
+        if peaks[source] < flow.ACTIVE_PEAK:
+            return Finding(
+                "unverified",
+                "Spotify is active but source PCM is silent; not evidence of a fault",
+            )
+        player = bridge.request("/player")
+        if not isinstance(player, dict) or player.get("state") not in (
+            "play",
+            "pause",
+            "stop",
+        ):
+            return Finding("unknown", "OwnTone PCM player state is unknown")
+        if player["state"] != "play":
+            return Finding(
+                "pcm_paused", "Source PCM is present but OwnTone's player is paused"
+            )
         if receiver_state == "corked":
             return Finding(
                 "receiver_corked",
@@ -526,17 +548,6 @@ class Runtime:
                     )
             except ERRORS as exc:
                 return Finding("wiim_unavailable", str(exc))
-        config = get_config()
-        source = config.bridge_sink + ".monitor"
-        target = config.displayport_sink + ".monitor"
-        peaks = flow.sample_peaks((source, target))
-        if not self.playing():
-            return Finding("idle", "Spotify stopped during the audio probe")
-        if peaks[source] < flow.ACTIVE_PEAK:
-            return Finding(
-                "unverified",
-                "Spotify is active but source PCM is silent; not evidence of a fault",
-            )
         if peaks[target] < flow.ACTIVE_PEAK:
             return Finding(
                 "downstream_silent", "Source PCM is present but the PC output is silent"
@@ -546,6 +557,16 @@ class Runtime:
         )
 
     def repair(self, finding: Finding, stage: int) -> str:
+        if finding.kind == "pcm_paused":
+            with output_control.locked():
+                if output_control.mode() not in ("auto", "local") or not self.playing():
+                    return "PCM resume cancelled: playback or manual intent changed"
+                changed = bridge.resume_pcm_playback()
+            return (
+                "Resumed the bridge PCM player"
+                if changed
+                else "Bridge PCM player resumed before intervention"
+            )
         if finding.kind == "receiver_misrouted":
             if self.receiver_route() is None:
                 return "Local receiver route changed; no stream was moved"
@@ -625,7 +646,7 @@ class Runtime:
                         )
                     if get_config().wiim_source_priority == "guarded":
                         self.source_guard()
-                    bridge.reconcile_once()
+                    bridge.reconcile_once(preserve_local=True)
                     bridge.resume_pcm_playback()
             except ERRORS:
                 self.fallback_pc_after_wiim_error()

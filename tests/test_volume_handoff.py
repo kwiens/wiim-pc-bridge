@@ -52,6 +52,27 @@ class VolumeHandoffTests(unittest.TestCase):
         self.assertIs(volume_handoff.parse_trace_activity(line), True)
         self.assertIsNone(volume_handoff.parse_trace_activity("connected\n"))
 
+    def test_trace_reader_retains_partial_line_without_blocking(self) -> None:
+        pending = bytearray()
+        self.assertEqual(volume_handoff.complete_trace_lines(pending, b'123 {"is_'), [])
+        self.assertEqual(
+            volume_handoff.complete_trace_lines(
+                pending, b'active":true}\n456 {"is_active":false}\n'
+            ),
+            ['123 {"is_active":true}', '456 {"is_active":false}'],
+        )
+        self.assertEqual(pending, b"")
+
+    def test_unbounded_trace_fragment_is_dropped(self) -> None:
+        pending = bytearray()
+        self.assertEqual(
+            volume_handoff.complete_trace_lines(
+                pending, b"x" * (volume_handoff.MAX_TRACE_LINE_BYTES + 1)
+            ),
+            [],
+        )
+        self.assertEqual(pending, b"")
+
     def test_only_inactive_to_active_transition_requests_handoff(self) -> None:
         tracker = volume_handoff.VolumeTracker(saved_volume=62)
         self.assertIsNone(tracker.observe_activity(True).handoff_volume)
@@ -149,7 +170,7 @@ class VolumeHandoffTests(unittest.TestCase):
             mock.patch("bridge.resume_pcm_playback", return_value=True) as resume,
         ):
             self.assertTrue(controller.observe(True, 10.0))
-        reconcile.assert_called_once_with()
+        reconcile.assert_called_once_with(preserve_local=True)
         resume.assert_called_once_with()
         self.assertFalse(controller.released)
 
@@ -196,17 +217,30 @@ class VolumeHandoffTests(unittest.TestCase):
             mock.patch("bridge.resume_pcm_playback", return_value=False),
         ):
             self.assertTrue(controller.observe(True, 0.0))
-        reconcile.assert_called_once_with()
+        reconcile.assert_called_once_with(preserve_local=True)
 
-    def test_selected_outputs_with_paused_pcm_player_are_resumed(self) -> None:
+    def test_selected_outputs_are_not_resumed_on_every_healthy_tick(self) -> None:
         controller = volume_handoff.IdleOutputController()
         with (
             mock.patch("bridge.outputs", return_value=pair()),
             mock.patch("bridge.reconcile_once") as reconcile,
-            mock.patch("bridge.resume_pcm_playback", return_value=True),
+            mock.patch("bridge.resume_pcm_playback") as resume,
+        ):
+            self.assertFalse(controller.observe(True, 0.0))
+        reconcile.assert_not_called()
+        resume.assert_not_called()
+
+    def test_controller_resumes_pipe_it_paused_for_idle(self) -> None:
+        controller = volume_handoff.IdleOutputController(pipe_paused=True)
+        with (
+            mock.patch("bridge.outputs", return_value=pair()),
+            mock.patch("bridge.reconcile_once") as reconcile,
+            mock.patch("bridge.resume_pcm_playback", return_value=True) as resume,
         ):
             self.assertTrue(controller.observe(True, 0.0))
         reconcile.assert_not_called()
+        resume.assert_called_once_with()
+        self.assertFalse(controller.pipe_paused)
 
     def test_manual_stop_is_not_undone_by_active_playback(self) -> None:
         output_control.set_automatic(False)

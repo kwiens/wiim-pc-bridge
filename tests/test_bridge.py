@@ -340,6 +340,7 @@ class PlayerRecoveryTests(unittest.TestCase):
             "items": [{"id": 42, "data_kind": "pipe", "path": "/srv/media/spotify.pcm"}]
         }
         with (
+            mock.patch.object(bridge, "PLAYER_RESUME_SETTLE_SECONDS", 0),
             mock.patch.object(
                 bridge,
                 "request",
@@ -353,6 +354,26 @@ class PlayerRecoveryTests(unittest.TestCase):
             self.assertRaisesRegex(bridge.BridgeError, "did not resume"),
         ):
             bridge.resume_pcm_playback()
+
+    def test_resume_waits_for_owntone_startup_buffer(self) -> None:
+        queue = {
+            "items": [{"id": 42, "data_kind": "pipe", "path": "/srv/media/spotify.pcm"}]
+        }
+        with (
+            mock.patch.object(
+                bridge,
+                "request",
+                side_effect=[
+                    {"state": "pause", "item_id": 42},
+                    queue,
+                    None,
+                    {"state": "pause"},
+                    {"state": "play"},
+                ],
+            ),
+            mock.patch.object(bridge.time, "sleep"),
+        ):
+            self.assertTrue(bridge.resume_pcm_playback())
 
 
 class ReconcileTests(unittest.TestCase):
@@ -405,6 +426,50 @@ class ReconcileTests(unittest.TestCase):
                 mock.call.select(state),
             ],
         )
+
+    def test_active_reconnect_keeps_pc_selected_through_wiim_rejoin(self) -> None:
+        state = self.desired()
+        pc_only = [{**state[0], "selected": True}, {**state[1], "selected": False}]
+        with (
+            configured(),
+            mock.patch.object(bridge, "validate_wiim_group"),
+            mock.patch.object(bridge, "outputs", side_effect=[pc_only, state]),
+            mock.patch.object(bridge, "set_outputs") as select,
+            mock.patch.object(bridge, "set_output_volume") as volume,
+            mock.patch.object(bridge, "set_output_offset") as offset,
+        ):
+            bridge.reconcile_once(preserve_local=True)
+        select.assert_called_once_with(pc_only)
+        self.assertEqual(volume.call_args_list, [mock.call(pc_only[1], 39)] * 2)
+        self.assertEqual(offset.call_args_list, [mock.call(pc_only[1], -80)] * 2)
+
+    def test_stale_wiim_reconnect_deselects_only_wiim(self) -> None:
+        state = self.desired()
+        with (
+            configured(),
+            mock.patch.object(bridge, "validate_wiim_group"),
+            mock.patch.object(bridge, "outputs", side_effect=[state, state]),
+            mock.patch.object(bridge, "set_outputs") as select,
+            mock.patch.object(bridge, "set_output_volume"),
+            mock.patch.object(bridge, "set_output_offset"),
+        ):
+            bridge.reconcile_once(preserve_local=True)
+        self.assertEqual(
+            select.call_args_list, [mock.call([state[0]]), mock.call(state)]
+        )
+
+    def test_pc_preserving_reconnect_rejects_unrelated_selection(self) -> None:
+        state = self.desired()
+        state.append(output("other", "Other", "AirPlay 1", selected=True))
+        with (
+            configured(),
+            mock.patch.object(bridge, "validate_wiim_group"),
+            mock.patch.object(bridge, "outputs", return_value=state),
+            mock.patch.object(bridge, "set_outputs") as select,
+            self.assertRaisesRegex(bridge.BridgeError, "unrelated"),
+        ):
+            bridge.reconcile_once(preserve_local=True)
+        select.assert_not_called()
 
     def test_idle_reconcile_configures_levels_without_airplay_connection(self) -> None:
         state = self.desired()

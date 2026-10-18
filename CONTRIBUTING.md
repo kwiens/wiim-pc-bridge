@@ -65,3 +65,13 @@ Do not include `.env`, credentials, cache databases, device identifiers, or
 private network details in commits, bug reports, or logs. `./doctor.py` output
 contains your sink names, device names, and LAN addresses — redact it before
 pasting it into an issue.
+
+## Audio incident reports
+
+For every audio fault, create or update a local report using
+`docs/incident-report-template.md`. Store installation-specific reports in
+`runtime/incidents/`, which Git ignores. Record the configuration and system
+state that preceded the issue, the evidence and timeline, the fix or attempted
+mitigation, and separate digital and audible verification. Keep the report open
+when a speaker path has not been confirmed by listening. Publish a report only
+after removing all installation-specific details and reviewing it for secrets.

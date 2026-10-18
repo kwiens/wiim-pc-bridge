@@ -25,6 +25,8 @@ API = "http://127.0.0.1:3689/api"
 LOCAL_TYPE = "AirPlay 1"
 WIIM_TYPE = "AirPlay 2"
 TIMEOUT_SECONDS = 5
+PLAYER_RESUME_SETTLE_SECONDS = 3.0
+PLAYER_RESUME_POLL_SECONDS = 0.25
 
 # Errors raised while reading a response body are not wrapped into URLError by
 # urllib, so they have to be named explicitly or they escape as tracebacks.
@@ -302,12 +304,44 @@ def set_volume(target: str, volume: int) -> None:
     print(f"Set {output.get('name')} volume to {volume}%.")
 
 
-def reconcile_once(*, activate: bool = True) -> None:
+def reconcile_once(*, activate: bool = True, preserve_local: bool = False) -> None:
     """Restore the tested topology, selections, levels, and sync offsets."""
     validate_wiim_group()
     config = get_config()
     items = outputs()
     local, wiim = resolve_pair(items)
+
+    selected_ids = {output_id(item) for item in items if item.get("selected") is True}
+    pair_ids = {output_id(local), output_id(wiim)}
+    if preserve_local and activate and output_id(local) in selected_ids:
+        if not selected_ids.issubset(pair_ids):
+            raise BridgeError("refusing to replace an unrelated selected output")
+        local_volume = output_integer(local, "volume")
+        local_offset = output_integer(local, "offset_ms")
+        # Only the WiiM session needs recycling. Leave the audible PC route
+        # selected across the disconnect/reconnect, and retain its current
+        # level instead of changing the listener's volume mid-track.
+        if output_id(wiim) in selected_ids:
+            set_outputs([local])
+        set_output_volume(wiim, config.wiim_volume)
+        set_output_offset(wiim, config.wiim_offset_ms)
+        set_outputs([local, wiim])
+        # A rediscovered permanent output can reset its cached level during
+        # selection. Restore it again before reporting a successful join.
+        set_output_volume(wiim, config.wiim_volume)
+        set_output_offset(wiim, config.wiim_offset_ms)
+        refreshed = outputs()
+        refreshed_local, refreshed_wiim = resolve_pair(refreshed)
+        if (
+            {output_id(item) for item in refreshed if item.get("selected") is True}
+            != pair_ids
+            or output_integer(refreshed_local, "volume") != local_volume
+            or output_integer(refreshed_local, "offset_ms") != local_offset
+            or output_integer(refreshed_wiim, "volume") != config.wiim_volume
+            or output_integer(refreshed_wiim, "offset_ms") != config.wiim_offset_ms
+        ):
+            raise BridgeError("OwnTone did not retain the PC-preserving output state")
+        return
 
     # Deselect first so the outputs are certainly idle, then apply levels before
     # reconnecting. Without the deselect, OwnTone may already have restored its
@@ -408,10 +442,14 @@ def resume_pcm_playback() -> bool:
             "refusing to resume an OwnTone queue other than the bridge PCM pipe"
         )
     request("/player/play", method="PUT")
-    refreshed = request("/player")
-    if not isinstance(refreshed, dict) or refreshed.get("state") != "play":
-        raise BridgeError("OwnTone PCM player did not resume")
-    return True
+    deadline = time.monotonic() + PLAYER_RESUME_SETTLE_SECONDS
+    while True:
+        refreshed = request("/player")
+        if isinstance(refreshed, dict) and refreshed.get("state") == "play":
+            return True
+        if time.monotonic() >= deadline:
+            raise BridgeError("OwnTone PCM player did not resume")
+        time.sleep(min(PLAYER_RESUME_POLL_SECONDS, deadline - time.monotonic()))
 
 
 def pause_pcm_playback() -> bool:

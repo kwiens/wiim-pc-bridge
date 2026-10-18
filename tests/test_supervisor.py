@@ -328,12 +328,85 @@ class SupervisorSequenceTests(unittest.TestCase):
         runtime = supervisor.Runtime()
         with (
             mock.patch.object(runtime, "pc_sink_available", return_value=True),
+            mock.patch.object(runtime, "playing", return_value=True),
             mock.patch("audio_flow_check.local_receiver_state", return_value="corked"),
-            mock.patch("audio_flow_check.sample_peaks") as sample,
+            mock.patch(
+                "audio_flow_check.sample_peaks",
+                return_value={
+                    "test_bridge_sink.monitor": 20,
+                    "alsa_output.test-card.monitor": 0,
+                },
+            ),
+            mock.patch("bridge.request", return_value={"state": "play"}),
         ):
             finding = runtime.probe("auto")
         self.assertEqual(finding.kind, "receiver_corked")
-        sample.assert_not_called()
+
+    def test_paused_pcm_takes_precedence_over_corked_receiver(self):
+        runtime = supervisor.Runtime()
+        with (
+            mock.patch.object(runtime, "pc_sink_available", return_value=True),
+            mock.patch.object(runtime, "playing", return_value=True),
+            mock.patch("audio_flow_check.local_receiver_state", return_value="corked"),
+            mock.patch(
+                "audio_flow_check.sample_peaks",
+                return_value={
+                    "test_bridge_sink.monitor": 20,
+                    "alsa_output.test-card.monitor": 0,
+                },
+            ),
+            mock.patch("bridge.request", return_value={"state": "pause"}),
+        ):
+            finding = runtime.probe("auto")
+        self.assertEqual(finding.kind, "pcm_paused")
+
+    def test_silent_source_does_not_recycle_wiim_airplay(self):
+        runtime = supervisor.Runtime()
+        with (
+            mock.patch.object(runtime, "pc_sink_available", return_value=True),
+            mock.patch.object(runtime, "playing", return_value=True),
+            mock.patch("audio_flow_check.local_receiver_state", return_value="ready"),
+            mock.patch(
+                "audio_flow_check.sample_peaks",
+                return_value={
+                    "test_bridge_sink.monitor": 0,
+                    "alsa_output.test-card.monitor": 0,
+                },
+            ),
+            mock.patch("bridge.validate_wiim_group") as group,
+            mock.patch("bridge.wiim_request") as wiim,
+        ):
+            finding = runtime.probe("auto")
+        self.assertEqual(finding.kind, "unverified")
+        group.assert_not_called()
+        wiim.assert_not_called()
+
+    def test_active_pcm_with_paused_player_uses_targeted_resume(self):
+        runtime = supervisor.Runtime()
+        with (
+            configured(),
+            mock.patch.object(runtime, "pc_sink_available", return_value=True),
+            mock.patch.object(runtime, "playing", return_value=True),
+            mock.patch("audio_flow_check.local_receiver_state", return_value="ready"),
+            mock.patch(
+                "audio_flow_check.sample_peaks",
+                return_value={
+                    "test_bridge_sink.monitor": 20,
+                    "alsa_output.test-card.monitor": 0,
+                },
+            ),
+            mock.patch("bridge.request", return_value={"state": "pause"}),
+            mock.patch("bridge.validate_wiim_group") as group,
+            mock.patch("bridge.resume_pcm_playback", return_value=True) as resume,
+            mock.patch("bridge_supervisor.command") as command,
+        ):
+            finding = runtime.probe("auto")
+            action = runtime.repair(finding, 0)
+        self.assertEqual(finding.kind, "pcm_paused")
+        self.assertIn("Resumed", action)
+        group.assert_not_called()
+        resume.assert_called_once_with()
+        command.assert_not_called()
 
     def test_route_repair_moves_only_identified_soloist_stream(self):
         runtime = supervisor.Runtime()
@@ -615,7 +688,7 @@ class SupervisorSequenceTests(unittest.TestCase):
         ) as command:
             runtime.repair(supervisor.Finding("wiim_disconnected", "stale"), 0)
         guard.assert_called_once()
-        reconcile.assert_called_once()
+        reconcile.assert_called_once_with(preserve_local=True)
         resume.assert_called_once()
         command.assert_not_called()
 
@@ -646,7 +719,7 @@ class SupervisorSequenceTests(unittest.TestCase):
         ) as reconcile, mock.patch("bridge.resume_pcm_playback") as resume:
             runtime.repair(supervisor.Finding("wiim_disconnected", "stale"), 0)
         guard.assert_not_called()
-        reconcile.assert_called_once()
+        reconcile.assert_called_once_with(preserve_local=True)
         resume.assert_called_once()
 
     def test_pc_fallback_honors_explicit_stop(self):

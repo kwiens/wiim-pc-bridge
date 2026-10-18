@@ -42,9 +42,10 @@ IDLE_DISCONNECT_SECONDS = 60.0
 IDLE_PIPE_PAUSE_SECONDS = 5.0
 RECEIVER_RECONNECT_SECONDS = 30
 RECEIVER_ADVERTISEMENT_SECONDS = 5
+MAX_TRACE_LINE_BYTES = 1024 * 1024
 
 stop_requested = False
-trace_process: subprocess.Popen[str] | None = None
+trace_process: subprocess.Popen[bytes] | None = None
 
 
 class PipelineStalled(RuntimeError):
@@ -73,6 +74,22 @@ def parse_trace_activity(line: str) -> bool | None:
         return None
     active = payload.get("is_active") if isinstance(payload, dict) else None
     return active if isinstance(active, bool) else None
+
+
+def complete_trace_lines(pending: bytearray, data: bytes) -> list[str]:
+    """Frame nonblocking trace reads without waiting on an incomplete line."""
+    pending.extend(data)
+    lines: list[str] = []
+    while True:
+        end = pending.find(b"\n")
+        if end < 0:
+            break
+        if end <= MAX_TRACE_LINE_BYTES:
+            lines.append(bytes(pending[:end]).decode("utf-8", "replace"))
+        del pending[: end + 1]
+    if len(pending) > MAX_TRACE_LINE_BYTES:
+        pending.clear()
+    return lines
 
 
 @dataclass
@@ -160,8 +177,8 @@ class IdleOutputController:
 
     def observe(self, playing: bool, now: float) -> bool:
         if playing:
+            resume_needed = self.pipe_paused or self.released
             self.idle_since = None
-            self.pipe_paused = False
             if now < self.retry_at:
                 return False
             try:
@@ -183,8 +200,13 @@ class IdleOutputController:
                         return False
                     reconnected = selected_ids != pair_ids
                     if reconnected:
-                        bridge.reconcile_once()
-                    resumed = bridge.resume_pcm_playback()
+                        bridge.reconcile_once(preserve_local=True)
+                    resumed = (
+                        bridge.resume_pcm_playback()
+                        if reconnected or resume_needed
+                        else False
+                    )
+                self.pipe_paused = False
                 self.released = False
                 self.retry_at = 0.0
                 self.retry_delay = PLAYBACK_POLL_INTERVAL
@@ -413,40 +435,45 @@ def monitor_trace(tracker: VolumeTracker) -> None:
         trace_command(),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
+        bufsize=0,
     )
     if trace_process.stdout is None:
         raise RuntimeError("could not read Soloist trace output")
 
+    os.set_blocking(trace_process.stdout.fileno(), False)
     selector = selectors.DefaultSelector()
     selector.register(trace_process.stdout, selectors.EVENT_READ)
+    pending = bytearray()
     next_sample = time.monotonic() + SAMPLE_INTERVAL
     mpris_missing_reported = False
     try:
         while not stop_requested:
             timeout = max(0.0, min(SAMPLE_INTERVAL, next_sample - time.monotonic()))
             for key, _mask in selector.select(timeout):
-                line = key.fileobj.readline()
-                if not line:
-                    return
-                active = parse_trace_activity(line)
-                if active is None:
+                try:
+                    data = os.read(key.fileobj.fileno(), 65536)
+                except BlockingIOError:
                     continue
-                change = tracker.observe_activity(active)
-                desired = change.handoff_volume
-                if desired is not None:
-                    if set_soloist_volume(desired):
-                        print(
-                            f"Preserved Spotify volume at {desired}% for the handoff.",
-                            flush=True,
-                        )
-                    else:
-                        print(
-                            f"Could not preserve Spotify volume at {desired}%.",
-                            file=sys.stderr,
-                            flush=True,
-                        )
+                if not data:
+                    return
+                for line in complete_trace_lines(pending, data):
+                    active = parse_trace_activity(line)
+                    if active is None:
+                        continue
+                    change = tracker.observe_activity(active)
+                    desired = change.handoff_volume
+                    if desired is not None:
+                        if set_soloist_volume(desired):
+                            print(
+                                f"Preserved Spotify volume at {desired}% for the handoff.",
+                                flush=True,
+                            )
+                        else:
+                            print(
+                                f"Could not preserve Spotify volume at {desired}%.",
+                                file=sys.stderr,
+                                flush=True,
+                            )
 
             now = time.monotonic()
             if now < next_sample:

@@ -201,9 +201,11 @@ credential can be committed by a stray `git add -A`.
   entrypoint refuses to capture from a pre-existing sink of that name whose
   format does not match.
 - PCM capture uses 44.1 kHz signed 16-bit stereo and a tested 100 ms fragment.
-- A small relay drains the capture client continuously and discards PCM when
-  OwnTone pauses or closes its FIFO. It does not queue minutes of stale game or
-  Spotify audio, or let a blocked writer grow PulseAudio's buffers until abort.
+- A small relay drains the capture client continuously. It keeps at most 512 KiB
+  of PCM in userspace while OwnTone's startup reader catches up, without relying
+  on privileged kernel FIFO resizing. It drops old buffered PCM on a prolonged
+  stall and discards PCM when OwnTone closes its FIFO; it cannot queue minutes
+  of stale game or Spotify audio or backpressure the source indefinitely.
 - OwnTone uses a configurable 2250 ms startup buffer by default.
 - Soloist and PCM capture run in **separate containers**. Losing the FIFO reader
   or restarting OwnTone can restart capture without killing Spotify Connect.
@@ -228,6 +230,10 @@ credential can be committed by a stray `git add -A`.
   full-stack restart. Two observations are required for destructive recovery,
   with buffering grace and at most three repairs per ten minutes. The budget
   survives supervisor restarts. An unavailable host audio server causes a wait.
+- During active playback, WiiM reconnection keeps the already-selected PC
+  output in place and restores the WiiM's configured level before joining it.
+  A quiet Spotify source does not trigger WiiM transport recycling; a paused
+  PCM player with active source samples gets a targeted, budgeted resume.
 - If PipeWire moves the identified Soloist stream to the desktop sink, the
   supervisor moves only that stream back to the private bridge sink. It checks
   this even while Spotify is paused, requires two observations, and limits
