@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -50,6 +52,31 @@ class DoctorTestCase(unittest.TestCase):
         self.addCleanup(doctor.warnings.clear)
         self.printed = mock.patch("builtins.print").start()
         self.addCleanup(mock.patch.stopall)
+
+
+class SupervisorCodeAgeTests(DoctorTestCase):
+    def test_detects_control_module_edited_after_process_start(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            for name in doctor.SUPERVISOR_SOURCES:
+                (project / name).write_text("# controller\n", encoding="utf-8")
+            started_at = time.time()
+            os.utime(project / "volume_handoff.py", (started_at + 3, started_at + 3))
+
+            self.assertEqual(
+                doctor.supervisor_sources_newer_than(started_at, project),
+                ["volume_handoff.py"],
+            )
+
+    def test_current_control_modules_are_not_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            for name in doctor.SUPERVISOR_SOURCES:
+                (project / name).write_text("# controller\n", encoding="utf-8")
+
+            self.assertEqual(
+                doctor.supervisor_sources_newer_than(time.time() + 2, project), []
+            )
 
 
 class OutputAuditTests(DoctorTestCase):

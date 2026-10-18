@@ -27,6 +27,14 @@ CONTAINERS = (
     "wiim-pc-bridge-soloist",
     "wiim-pc-bridge-capture",
 )
+SUPERVISOR_SOURCES = (
+    "bridge_supervisor.py",
+    "volume_handoff.py",
+    "bridge.py",
+    "audio_flow_check.py",
+    "output_control.py",
+    "bridge_config.py",
+)
 SINK_FIELD = re.compile(r"^\s*Sink:\s*(\d+)\s*$", re.MULTILINE)
 SOURCE_FIELD = re.compile(r"^\s*Source:\s*(\d+)\s*$", re.MULTILINE)
 BUILD_DATE = re.compile(r"\((\d{8})\)")
@@ -316,8 +324,35 @@ def check_supervisor() -> None:
             report("WARN", f"supervisor {state['state']}: {state['detail']}")
         else:
             report("PASS", f"supervisor {state['state']}: {state['detail']}")
+        pid = int(state["pid"])
+        if pid <= 0:
+            raise ValueError("invalid supervisor PID")
+        process_dir = Path("/proc") / str(pid)
+        command_line = (process_dir / "cmdline").read_bytes().split(b"\0")
+        if not any(part.endswith(b"bridge_supervisor.py") for part in command_line):
+            report("FAIL", "supervisor heartbeat PID is not the bridge supervisor")
+            return
+        stale_sources = supervisor_sources_newer_than(
+            process_dir.stat().st_ctime, PROJECT
+        )
+        if stale_sources:
+            report(
+                "WARN",
+                "supervisor predates edited control code: "
+                + ", ".join(stale_sources)
+                + "; restart only the supervisor to load it",
+            )
     except (OSError, ValueError, KeyError, TypeError) as exc:
         report("FAIL", f"supervisor state unavailable: {exc}")
+
+
+def supervisor_sources_newer_than(started_at: float, project: Path) -> list[str]:
+    """Find controller modules edited after the running process started."""
+    return [
+        name
+        for name in SUPERVISOR_SOURCES
+        if (project / name).stat().st_mtime > started_at + 1.0
+    ]
 
 
 def block_sink_id(block: str) -> str | None:
